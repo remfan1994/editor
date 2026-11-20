@@ -1,15 +1,137 @@
 EDITOR(1)
-editor 0.6.8 - a small, dependency-light, full-screen text editor
+editor 0.6.13 - a small, dependency-light, full-screen text editor
 
 NAME
     editor - edit a text file using plain commands or a numbered menu
 
 SYNOPSIS
-    editor [--menu] [--mouse] [--movement|--edit] [--no-keys] [FILE|-]
+    editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [FILE|-]
     editor --help | --manual | --about | --version
 
-BUILD
-    cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor
+BUILD AND INSTALL (FIRST INSTALL OR UPDATE)
+Run these commands from this extracted minimal-editors directory, as the
+account that will use editor. The && operators stop the sequence if a step
+fails, so a failed compilation does not install an older local executable.
+
+    mkdir -p "$HOME/.local/bin" &&
+    cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor &&
+    install -m 755 editor "$HOME/.local/bin/editor" &&
+    "$HOME/.local/bin/editor" --version
+
+For the standalone source download, substitute editor-0.6.13.c for editor.c
+in the compilation command above.
+
+Repeat this build-and-install sequence after each source update. Compiling
+creates ./editor in the current directory; it does not update the installed
+executable. The install command replaces $HOME/.local/bin/editor.
+
+ONE-TIME PATH SETUP
+To run editor by name, $HOME/.local/bin must be on PATH. If it is not already
+present, add this line once to ~/.profile for your OpenBSD ksh login:
+
+    export PATH="$HOME/.local/bin:$PATH"
+
+Apply the profile to the current shell:
+
+    . "$HOME/.profile"
+
+Check which executable will run, then check its version:
+
+    command -v editor
+    editor --version
+
+The first command should identify $HOME/.local/bin/editor. If it identifies
+another copy or a shell alias/function, resolve that before relying on the
+bare editor command. The explicit path $HOME/.local/bin/editor bypasses that
+name lookup. Other shells may use a different login/startup file. PATH setup
+is only needed once; do not append it again for each editor update.
+
+RUN
+    editor config.conf
+    editor --menu config.conf
+
+You can still run the uninstalled build as ./editor config.conf.
+
+EXTERNAL COMMANDS AND USER-DEFINED COMMANDS
+
+    shell ls -1
+        Execute /bin/sh -c 'ls -1' and insert its standard output at cursor.
+        With no argument, shell asks for the command at Shell>.
+
+    filter sort
+        Send the entire document through sort and replace it with stdout.
+
+    filter-lines 3-9 sort -u
+        Send only complete lines 3 through 9 to the command, replacing those
+        lines with captured output. Use one line number for a single line.
+
+    All three are available under Edit in the menu. Each successful operation
+    is one undo step. The shell child runs with editor's OS privileges and
+    working directory. When editor runs as root, the child also runs as root.
+    Shell commands are therefore explicit only: opening a document, pasting,
+    loading a config, and reading a script cannot execute arbitrary text.
+    No terminal input is provided to shell commands. For filter, stdin is the
+    selected document text. stdout is the only text inserted; stderr and exit
+    status are kept separate. A nonzero exit, interrupt, allocation failure,
+    excessive output, or NUL/escape/control byte rejects the whole edit.
+    CR, LF and CRLF output is normalized to the document's newline style.
+    Do not use curses or interactive programs like vi, less, or top this way.
+    Filters may legitimately return empty output and thereby delete text.
+    Undo reverses each successful insertion or replacement.
+
+    define files shell ls -1
+        Save a custom editor command named files; type files to run it.
+
+    define stamp shell date
+        Save a name for a shell-output insertion.
+
+    functions
+        List the saved definitions. functions reload rereads the file.
+    undefine files
+        Remove a definition.
+
+    run ~/commands.editor
+        Execute a plaintext editor-command script, one instruction per line.
+        # comments and empty lines are ignored. Example file:
+
+            # Build a header
+            shell date
+            shell uname -a
+
+    define header run ~/commands.editor
+        Bind the script to a custom command named header. Type header to run.
+
+    Only user-owned, non-group/other-writable regular script files are read;
+    script file size is limited to 32 KiB. Scripts are never run automatically
+    on startup or opening documents. A script can use shell, filter,
+    filter-lines, find, next/prev, goto, top/bottom, undo/redo,
+    movement/edit, run, and named custom commands. Other editor commands
+    (including quit, read, write, define) are refused within scripts to
+    prevent unexpected interactive prompts or document switches. A script
+    stops on failure, after no more than 200 executed steps or 8 nested
+    definitions/scripts. Earlier successful steps stay in the undo history,
+    one entry per edit; a script is NOT an all-or-nothing transaction.
+
+    Optional hotkeys can invoke defined commands: bind F2 files. No default
+    bindings are added; defining a command never assigns a key.
+
+    User definitions are stored in $XDG_CONFIG_HOME/editor/commands.conf,
+    or ~/.config/editor/commands.conf (not in config or keys.conf). This is
+    inert text loaded at startup. Names begin with a lowercase ASCII letter
+    and continue with lowercase letters, digits, hyphen or underscore,
+    maximum 31 characters. They cannot replace a built-in command or alias.
+    Each definition is a single editor command line, up to 2047 bytes.
+    Built-ins always win. User commands currently take no arguments; script
+    files provide multi-step behavior without introducing a new language.
+    Up to 32 definitions are saved atomically. A stale editor refuses to
+    overwrite externally changed command definitions: functions reload
+    refreshes them. File permissions and errors are reported instead of
+    silently executing or ignoring unsafe definitions.
+
+    For shell and filter, /bin/sh interprets the command text exactly as
+    requested. Do not run untrusted command strings or pass untrusted shell
+    fragments. Running a root-owned editor means shell commands run as root.
+
 
 DESCRIPTION
     editor is a small C text editor for configuration files and other
@@ -24,8 +146,8 @@ DESCRIPTION
 MOVEMENT MODE
     Default is ordinary text editing: typing inserts text, and Backspace,
     Delete, and Enter edit text. To enter the navigation-only mode, type
-    'movement' at Command>, or choose Controls > Movement. The 'edit'
-    command (Controls > Edit) returns to typing. A startup option also exists:
+    'movement' at Command>, or choose Controls > Current editing. The 'edit'
+    command returns to typing; Controls > Current editing offers one switch. A startup option also exists:
 
         editor --movement example.conf
 
@@ -55,42 +177,78 @@ MOVEMENT MODE
     Search commands 'next/n' and 'prev/p' still operate from Command>;
     within movement mode, the single letters n and p move down/up.
 
-STARTUP CONFIGURATION
-    Default startup is ordinary editing. To start in movement instead, put:
+PROGRAM SETTINGS AND CONFIGURATION
+    settings opens Help > Settings. Each switch occupies ONE row, showing
+    its current choice. Selecting it switches to the other choice and saves.
+    It does not open separate entries for each possible value.
+
+        toggle-esc          Esc opens: Command line / Menu.
+        toggle-startup      Next launch: Edit / Movement.
+        toggle-mouse        Mouse input: Off / On.
+        toggle-signals      Interrupt: Exit / Cancel input.
+        toggle-cliphistory  Clipboard history: Off / On.
+
+    All five commands take NO arguments. Each switches one setting, saves it,
+    and reports the result. A second invocation switches it back. Failed
+    saves do not silently apply session-only changes. The Settings menu calls
+    those exact commands and retains the selected row after success. Errors
+    stay visible instead of disappearing behind the menu.
+
+    toggle-startup changes the NEXT launch, not this session's movement/edit
+    mode. The other switches apply now as well as after restarting. The
+    current-session commands movement and edit remain explicit operations;
+    Controls > Current editing presents them as one switch without saving.
+
+    settings show is read-only. It reports the actual config path, saved
+    choices, current choices and clipboard-history state. The menu has a
+    Current / saved settings entry for this same report. help settings and
+    help toggle-startup (or any other toggle) explain purpose and examples.
+    Tab completes names, but never runs them. settings alone opens the menu.
+
+    The default config path is ~/.config/editor/config. With an absolute
+    XDG_CONFIG_HOME, it is $XDG_CONFIG_HOME/editor/config instead. Example:
 
         startup=movement
+        esc=menu
+        mouse=off
+        signal_controls=off
 
-    in $XDG_CONFIG_HOME/editor/config, when XDG_CONFIG_HOME is an absolute
-    pathname, or ~/.config/editor/config otherwise. To start in editing:
+    Defaults: startup=edit, esc=cli, mouse=off, signal_controls=off. Existing
+    startup/esc/signal_controls config keys keep their meanings. Mouse is now
+    saved here as well. Clipboard-history preference retains its existing
+    clipboard-history.enabled file alongside clipboard data in the state
+    directory; existing installations do not need to migrate it. Default is
+    Off, and turning it off does not delete stored snapshots.
 
-        startup=edit
+    Blank lines, # comments, spaces around '=', CRLF and a missing final
+    newline are accepted. Unknown/invalid entries warn. Config is inert text,
+    never shell code. The maximum size is 32 KiB; NUL/nonregular files are
+    refused. Owned 0755 directories and 0644 files work. Group/other writable
+    paths, foreign ownership and symlinked final config paths are refused.
+    A missing config means defaults; an unreadable config produces an error.
 
-    The config is plain text, not a shell script. Blank lines, # comments,
-    spaces around '=', CRLF, and a missing final newline are accepted.
-    Unknown keys or invalid values are ignored with a startup warning.
-    The maximum config size is 32 KiB. NUL bytes, symlinks and special files
-    are refused. The editor config directory must be owned by you and private
-    (chmod 700); the config must be owned by you and not writable by others.
-    An absent config does not cause an error or create files automatically.
+    Setting changes preserve comments, unrelated lines and line endings.
+    Duplicate occurrences of a changed key are updated. Replacement is staged
+    and intervening config changes are checked. Failures before replacement
+    retain the prior file and live behavior. Post-commit directory-sync
+    failures warn about durability rather than claiming nothing was saved.
+    New/replaced config files use 0600; existing directory permissions remain.
+    Hard-linked config files are not replaced. Final writer races remain.
 
-    A safe initial setup, without replacing an existing configuration:
+    --movement/--edit, --menu/--cli and --mouse/--no-mouse override one launch
+    without writing preferences. Last flag in each pair wins. A toggle uses
+    the displayed live choice for Esc/mouse/signals; toggle-startup uses the
+    latest saved startup choice. --no-keys disables user keybindings only.
+    -- ends option parsing for filenames beginning with a dash.
 
-        mkdir -p "$HOME/.config/editor"
-        chmod 700 "$HOME/.config/editor"
-        ./editor "$HOME/.config/editor/config"
-
-    Add startup=movement, then write. Adjust the path when using XDG_CONFIG_HOME.
-    The bundle also contains editor.conf.example, which is not installed
-    automatically. User hotkeys remain in the separate keys.conf file.
-
-    --movement and --edit override the saved startup preference for that run.
-    If both are supplied, the last explicit option wins. Neither the flags
-    nor the movement/edit commands rewrite your saved startup preference.
-    --no-keys disables user key bindings, not the startup preference.
-    -- ends command-line option parsing for names beginning with '-'.
-
-    Older bindings invoking 'mode movement' or 'mode edit' must be changed to
-    'movement' or 'edit'. The old mode command is not a hidden alias.
+    MIGRATION FROM 0.6.9
+    The old startup, toggle-mode, mouse and signals commands do not execute.
+    They show the new toggle name and retain the draft for correction; no
+    old explicit on/off request is silently converted into a toggle. Likewise,
+    cliphistory now only browses snapshots; toggle-cliphistory changes whether
+    they are collected. Update your own keys.conf entries that use retired
+    commands. No default keybindings are installed. Keep startup=movement in
+    config as written: it is a setting key, not the retired startup command.
 
 TERMINAL SIGNAL SETTINGS
     Ctrl+C and Ctrl+Z are never editor command bindings. Editor preserves the
@@ -118,15 +276,12 @@ TERMINAL SIGNAL SETTINGS
     This switch does NOT install Ctrl-key bindings, disable terminal signals,
     or override the configured interrupt/suspend characters.
 
-    To inspect or change the CURRENT SESSION without rewriting config:
-
-        signals
-        signals on
-        signals off
-        signals toggle
-
-    Controls > Signal handling: OFF/ON toggles the same setting. Use config
-    for the saved preference. Esc remains the ordinary cancel/back control.
+    settings show reports handling without changing it. toggle-signals
+    switches signal_controls=on/off, saving before applying. The preference
+    survives restarting editor. Help > Settings > Signals uses the same
+    saved operation. A failure is shown explicitly and retains prior behavior.
+    This updates only the signal_controls key, not startup or Esc preferences.
+    Esc remains the ordinary cancel/back control.
     Ctrl+C/Z bindings in older keys.conf files are ignored; attempts to bind
     them are refused. The rest of your user-defined keymap is unchanged.
 
@@ -190,8 +345,7 @@ COMMANDS
     clipboard default Return to the original unnamed clipboard.txt slot.
     clipboard list    Browse all saved clipboard slots.
     cliphistory       Browse prior clips in a read-only viewer.
-    cliphistory on    Enable persistent clipboard history (64 entries).
-    cliphistory off   Disable history; old entries remain on disk.
+    toggle-cliphistory  Switch and save history collection (max 64 entries).
     clipuse [N]       Restore clipboard snapshot N, newest first; ask if absent.
     dline             Delete the cursor's entire line.
     dline 30          Delete line 30.
@@ -215,12 +369,15 @@ COMMANDS
     pageup/pagedown   Move by a screenful.
     movement          Enter navigation-only control (aliases: move, navigation).
     edit              Return to typing (aliases: editmode, insertmode, typing).
-    menu / cli        Make Esc open the menu / command prompt.
-    mouse [on|off|toggle]  Control optional mouse handling.
+    toggle-esc        Switch and save Esc: Command line / Menu.
+    toggle-startup    Switch and save next launch: Edit / Movement.
+    toggle-mouse      Switch and save mouse input: Off / On.
+    toggle-signals    Switch and save interrupt: Exit / Cancel input.
+    settings          Open Help > Settings without changing preferences.
+    settings show     Report saved/current values and actual config path.
     bind KEY COMMAND  Create a user-defined hotkey for a built-in command.
     unbind KEY        Remove a user-defined binding.
     bindings          Display all user-defined bindings.
-    signals [on|off|toggle]  Report/change optional signal handling (default off).
     suspend           Suspend and restore terminal state; resume with fg.
     about             Show credits and BLOODGUILT CURSE notice.
     list              All commands grouped by task, with explanations.
@@ -366,7 +523,8 @@ LINE DELETION
     Synonyms are alternate spellings of the same operation, not key codes.
 
 MENU
-    Start with "editor --menu file.conf", or type "menu" at Command>.
+    Start with "editor --menu file.conf", or use toggle-esc to switch and
+    save the Esc choice. toggle-esc switches back when repeated.
     The main menu is grouped rather than a long flat list:
 
        1 Write             Save the current file (or choose another name)
@@ -374,8 +532,8 @@ MENU
        3 Edit >            Undo, redo, range and boundary deletions
        4 Move >            Find, next/previous match, goto, movement
        5 History >         Reverse, numbered history jump, history counts
-       6 Controls >        Movement/edit mode, mouse, bindings, Esc, pipe
-       7 Help >            Getting started, tasks, command lookup, manual, about
+       6 Controls >        Current editing switch, write to pipe, suspend
+       7 Help >            Guides, manual, About, Settings >
        8 Command line      Open a command prompt
        9 Exit >            Normal quit or confirmed discard and quit
 
@@ -442,9 +600,9 @@ CLIPBOARD AND TEMPORARY CLIPBOARD EDITING
     clipboard sub-editor. The footer shows operation/error messages first;
     otherwise it identifies the return destination.
 
-    Optional clipboard history is OFF by default. Use cliphistory on to
-    enable persistent snapshots, cliphistory to list them, clipuse N to
-    restore a snapshot, and cliphistory off to stop recording new snapshots.
+    Optional clipboard history is OFF by default. toggle-cliphistory
+    switches and saves collection. cliphistory lists snapshots; clipuse N
+    restores one. Turning collection off retains existing snapshots.
     At most 64 snapshots are retained; older snapshots are deleted as
     needed after a successful complete scan. A failed initial scan does not
     remove snapshots or supply a partial numbered list for restoration.
@@ -525,7 +683,8 @@ HELP, LIST AND SMALL WINDOWS
     all at once on that size of screen. No new hotkeys are assigned.
 
 MOUSE (OPTIONAL)
-    Start with --mouse, or enter "mouse on"; "mouse off" disables it.
+    toggle-mouse switches and saves mouse input. --mouse/--no-mouse
+    overrides the saved value for one launch without writing config.
     Mouse support starts OFF. Left click in text places the cursor; the
     wheel scrolls; clicking the status row opens the menu; clicking a menu
     item activates it. This uses VT/xterm mouse sequences. Some terminals
@@ -626,6 +785,30 @@ SAVING AND UNDO
     unless your edits change them. New Enter characters use the first
     newline style found in the file, or LF by default. NUL bytes are refused.
 
+PASTING FROM THE TERMINAL
+    Terminal paste recognizes CR, LF and CRLF line breaks and inserts each
+    using the document's current newline style (the first newline found
+    when opened, or LF for a new file). A CRLF pair produces one line break,
+    not two. CRLF pairs split across terminal reads are handled together.
+    Blank lines, indentation, tabs, UTF-8 and an absent final newline are
+    retained. The two literal characters ^M are not changed.
+
+    One complete terminal paste is one undoable change. Conversion happens
+    while collecting the paste, without a second full-sized buffer. The
+    document limit applies after conversion; a paste that would exceed it
+    is rejected without partly inserting the text.
+
+    This applies only to bracketed paste received from the terminal, including
+    when editing a clipboard. Files opened with read, piped input, and the
+    editor's paste [SLOT] command remain byte-preserving. Existing document
+    bytes are not normalized or repaired automatically. Multiline pastes at
+    Command> and argument prompts remain rejected without execution.
+
+    This fixes the earlier behavior that saved CR-only terminal newlines
+    as visible ^M characters on one long line. Undo a bad paste or remove
+    that inserted block, then paste the original text again with this version.
+    Simply hiding ^M or deleting CR bytes would join lines, not fix them.
+
 TERMINAL AND LIMITATIONS
     VT/xterm-compatible terminal, Unix, and a system C compiler for the
     build. No ncurses. Tested on Linux; OpenBSD SIGWINCH compile fix is
@@ -637,7 +820,7 @@ TERMINAL AND LIMITATIONS
     private plaintext file, not the desktop clipboard.
 
 ABOUT
-    editor 0.6.8
+    editor 0.6.13
     design by remfan1994
     published by ThatIAm.vip
 
@@ -646,6 +829,19 @@ ABOUT
     www.bloodguiltcurse.net has the Bible study
 
 RELIABILITY, FAILURE HANDLING, AND HISTORY ARCHIVES
+    Failed creation of a staging file never removes a filename that editor
+    did not successfully create. Cleanup retains the original error instead
+    of replacing it with a secondary cleanup error. Drafts and existing
+    destinations remain intact when that preparation fails.
+
+    Staged saves check pending interrupt, suspend and termination requests
+    before publishing the replacement, including after successful file sync.
+    With opt-in interrupt cancellation, retry can use the same draft after
+    returning to the editor. Default native interruption still exits and loses
+    unsaved changes. A completed write is never rolled back merely because a
+    later signal, journal save or directory synchronization fails. Signals and
+    concurrent writers can still arrive after the final check.
+
     An unchanged write verifies disk contents without replacing the file or
     changing its modification time. Changed undo/redo positions can be saved
     without rewriting the document. Repeated unchanged writes skip work.

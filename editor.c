@@ -1,5 +1,5 @@
 /*
- * editor 0.6.8 - a small, single-file terminal text editor.
+ * editor 0.6.13 - a small, single-file terminal text editor.
  * Build: cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor
  * Run:   ./editor [FILE]
  *
@@ -8,14 +8,16 @@
  * an empty command prompt asks for confirmation before quitting.
  * Commands: write [FILE], find [TEXT], next/n, prev/p, replace, replaceall,
  *           undo [N], redo [N], reverse, history,
- *           menu, cli, about, manual,
+ *           toggle-esc, toggle-startup, settings, about, manual,
  *           help, list, quit, quit!. Startup --menu uses an arrow-key menu for Esc.
  * About/manual are read-only pages; q or Esc returns to editing.
  *
  * Uses libc and Unix terminal interfaces, without curses or terminfo.
  * One file, horizontal scrolling, up to 8 MiB. Optional user key bindings.
  * Existing bytes and line endings are preserved; Enter uses the first
- * newline style in the file. New files use LF. NUL bytes are refused.
+ * newline style in the file. Terminal paste converts CR/LF/CRLF to that
+ * style; file-backed clipboard commands keep their bytes. New files use LF.
+ * NUL bytes are refused.
  * UTF-8 movement is by code point. Zero-width/nonprinting characters
  * are shown as escapes; complex Unicode shaping is outside this scope.
  * Undo groups consecutive typing; a paste is one change.
@@ -37,6 +39,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <errno.h>
 #include <ctype.h>
 #include <dirent.h>
@@ -60,7 +63,8 @@
 
 #define LIMIT ((size_t)8 * 1024 * 1024)
 #define COMMAND_SIZE 4096
-#define VERSION "0.6.8"
+#define CONFIG_LIMIT ((size_t)32768)
+#define VERSION "0.6.13"
 #define COMMAND_HISTORY_MAX 32
 #define JOURNAL_LIMIT ((size_t)128 * 1024 * 1024)
 #define JOURNAL_CHANGE_LIMIT 100000
@@ -94,17 +98,17 @@ static const char exit_notice[] =
 
 static const char manual_text[] =
     "EDITOR MANUAL\n"
-    "editor 0.6.8\n"
+    "editor 0.6.13\n"
     "\n"
-    "RUN: editor [--menu] [--mouse] [--movement|--edit] [--no-keys] [FILE|-]\n"
+    "RUN: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [FILE|-]\n"
     "\n"
     "EDIT MODE (default): Type text. Arrows, Home/End and PgUp/PgDn move.\n"
     "  Backspace/Delete erase. Enter inserts newline; Tab inserts tab.\n"
     "  Esc opens Command>; a second Esc asks Really quit? (Y/n).\n"
-    "  movement enters navigation-only control; edit or Enter resumes typing.\n"
+    "  Terminal paste converts CR/LF/CRLF to this file's newline style.\n"
+    "  movement navigates; edit or Enter resumes typing.\n"
     "  MOVEMENT: arrows/hjkl, Ctrl-P/N/B/F, p/n/b/f, 0/$ or a/e,\n"
     "    g/G document ends, y/v pages, w/@ next word, Home/End, PgUp/PgDn.\n"
-    "    Movement never edits; Esc opens controls.\n"
     "\n"
     "MENU: arrows/jk move; Enter/l selects; Esc/h goes back.\n"
     "  Number+Enter selects. Mouse is optional.\n"
@@ -112,15 +116,21 @@ static const char manual_text[] =
     "COMMANDS: list explains commands by task; list WORD filters them.\n"
     "  help starts here; help NAME gives examples and synonyms.\n"
     "  Esc/q returns to Command>; Enter on a blank prompt resumes editing.\n"
-    "  Unknown commands retain your draft; suggestions never run.\n"
     "  write [FILE]       Save; write FILE changes active filename on success.\n"
     "  read [FILE]        Open file (save edits before switching).\n"
+    "  shell ls -1        Insert shell stdout at cursor (one undo).\n"
+    "  filter sort        Replace document with stdout of a filter (one undo).\n"
+    "  filter-lines 3-9 sort  Filter only numbered complete lines.\n"
+    "  define files shell ls -1  Save a custom command; type files to use.\n"
+    "  functions          List commands; functions reload refreshes.\n"
+    "  undefine files     Remove a user-defined command.\n"
+    "  run ~/commands.editor  Execute a trusted plaintext command script.\n"
     "  ls [DIRECTORY]     Browse folders; Tab completes paths after commands.\n"
-    "  copy/cut [LINE|A-B] Copy or cut lines into the selected clipboard.\n"
-    "  paste [SLOT]       Paste current clipboard, or named slot (e.g. paste 2).\n"
-    "  clipboard          Edit selected clipboard (aliases: clip, cb, cboard).\n"
-    "  clipboard 2        Select persistent clipboard slot 2 (copy uses it).\n"
-    "  cliphistory [on|off]  List or toggle optional saved clipboards.\n"
+    "  copy/cut [N|A-B]   Copy or cut lines to the clipboard.\n"
+    "  paste [SLOT]       Paste current or named clipboard.\n"
+    "  clipboard          Edit selected clipboard; repeat to return.\n"
+    "  clipboard 2        Select persistent clipboard 2.\n"
+    "  cliphistory        Browse saved clipboard snapshots.\n"
     "  write -            Send text to redirected stdout.\n"
     "  dline [N]          Delete current or numbered line.\n"
     "  deleol              Delete cursor through end of line (keep newline).\n"
@@ -135,20 +145,36 @@ static const char manual_text[] =
     "    Bare find prompts; spaces in Find> are preserved exactly.\n"
     "  next/n, prev/p    Next or previous match of last search.\n"
     "  replace, replaceall  Literal replacement; prompts or OLD => NEW.\n"
-    "  goto [LINE [COLUMN]] 1-based navigation; top/bottom to endpoints.\n"
-    "  up/down/left/right [N]  Move by N steps (default one).\n"
-    "  movement / edit    Navigate only / resume ordinary typing.\n"
+    "  goto [LINE [COL]]  Go to a position; top/bottom to endpoints.\n"
+    "  up/down/left/right [N]  Move N steps.\n"
     "  Config: ~/.config/editor/config or $XDG_CONFIG_HOME/editor/config.\n"
     "    startup=movement or startup=edit (default); --movement/--edit overrides.\n"
-    "  menu / cli         Change what Esc opens.\n"
-    "  mouse [on|off]     Optional mouse handling.\n"
-    "  signals [on|off|toggle]  Optional signal handling (default OFF).\n"
+    "  toggle-esc         Switch and save Esc: Menu / Command line.\n"
+    "  settings           Open Help > Settings.\n"
+    "  toggle-startup     Switch and save startup: Edit / Movement.\n"
+    "  toggle-mouse       Switch and save optional mouse input.\n"
+    "  toggle-signals     Switch and save signal handling (default OFF).\n"
+    "  toggle-cliphistory Switch and save clipboard history (default OFF).\n"
+    "  settings show      Inspect current/saved values and config path.\n"
     "  bind KEY COMMAND   User-assigned hotkey; none by default.\n"
     "  quit / quit!       Normal exit / discard changes.\n"
     "\n"
+    "\n"
+    ;
+static const char manual_extension[] =
+    "SHELL/SCRIPTS: Commands run explicitly under the editor's OS user.\n"
+    "  Root editor runs child shell as root. No script runs on file open.\n"
+    "  Shell captures stdout only; nonzero exit, binary or size errors refuse edit.\n"
+    "  Script files: one command per line; # comments; 200 steps and 8 levels.\n"
+    "  Scripts permit shell/filter/find/goto/undo/redo/movement/edit/run.\n"
+    "  Each script edit is its own undo step; no rollback of earlier steps.\n"
+    "  Definitions: ~/.config/editor/commands.conf (XDG override).\n"
+    "  User names are lowercase ASCII; built-in commands cannot be redefined.\n"
+    "  See help shell, help filter, help define, help run for details.\n"
+    "\n"
     "SIGNALS: Ctrl-C/Z remain terminal controls (including remapping).\n"
     "  Interrupt exits, LOSING UNSAVED TEXT; stop suspends (fg resumes).\n"
-    "  Config signal_controls=on makes interrupt cancel instead (default off).\n"
+    "  toggle-signals saves cancellation/native exit behavior.\n"
     "  Ordinary quit prints a notice; quick/discard/signal exits skip it.\n"
     "\n"
     "COMMAND INPUT: Tab completes a command name or alias.\n"
@@ -160,12 +186,11 @@ static const char manual_text[] =
     "\n"
     "SAVING: Staged replacement; multiple hard links refused.\n"
     "  Persistent undo is private; unsaved edits are not recoverable.\n"
-    "  Clipboard editor keeps original file and undo chain in memory.\n"
+    "  Clipboard editing preserves the original document.\n"
     "  write saves the clipboard and stays; clipboard saves and returns.\n"
 
     "  Clips: $XDG_STATE_HOME/editor/ or ~/.local/state/editor/.\n"
-    "  clipboard.txt / clipboard-N.txt; private plaintext.\n"
-    "  History defaults off (64 entries). Viewer: Esc/q closes; arrows/hjkl move.\n"
+    "  Viewer: Esc/q closes; arrows/hjkl move.\n"
     "\n"
     "ABOUT\n"
     "  design by remfan1994\n"
@@ -173,6 +198,16 @@ static const char manual_text[] =
     "  BLOODGUILT CURSE\n"
     "  Cows aren't killers, and beef is the bloodshed of the innocent.\n"
     "  www.bloodguiltcurse.net has the Bible study\n";
+/* Two source string literals avoid the ISO C99 4095-byte literal limit. */
+static const char *manual_full(void)
+{
+    static char whole[sizeof manual_text + sizeof manual_extension];
+    if (!whole[0]) {
+        memcpy(whole,manual_text,sizeof manual_text-1);
+        memcpy(whole+sizeof manual_text-1,manual_extension,sizeof manual_extension);
+    }
+    return whole;
+}
 typedef struct { char *s; size_t n, cap; } Buffer;
 typedef struct Change Change;
 struct Change {
@@ -195,6 +230,10 @@ static bool goal_set, group, command_mode, filename_mode, menu_preferred, menu_o
  * keeps printable characters available for literal text entry. */
 static bool movement_mode;
 static bool startup_config_warning;
+/* Saved startup preference is independent of the current document mode. */
+static bool startup_movement, startup_esc_menu, startup_signals, startup_mouse;
+static bool startup_sync_warning;
+static int startup_config_error;
 /* OFF leaves interrupt/stop to terminal job control. ON opts into the
  * editor's cancel-on-interrupt behavior, never a keyboard binding. */
 static volatile sig_atomic_t signal_controls;
@@ -293,6 +332,20 @@ static char command_page[16384];
 static char directory_page[131072], clipboard_page[32768];
 #define CLIP_HISTORY_MAX 64
 static const char help_topics[] =
+    "PROGRAM SETTINGS\n"
+    "  settings opens Help > Settings (no interface preference is changed).\n"
+    "  toggle-startup switches Edit / Movement for future sessions only.\n"
+    "  movement / edit changes only this session's text-entry mode.\n"
+    "  toggle-esc switches the ONE saved Esc choice: Menu or Command line.\n"
+    "  toggle-signals switches and saves interrupt behavior; OFF is the default.\n"
+    "  toggle-mouse and toggle-cliphistory also switch and save their choices.\n"
+    "  Each toggle takes NO arguments. settings show gives current/saved values and path.\n\n"
+    "EXTENDING EDITOR\n"
+    "  shell COMMAND inserts stdout at cursor; shell alone asks for command.\n"
+    "  filter COMMAND replaces document with stdout (one undo).\n"
+    "  filter-lines N-M COMMAND transforms complete numbered lines.\n"
+    "  define NAME COMMAND saves a custom command. functions lists them.\n"
+    "  run FILE executes trusted plaintext scripts, never automatically.\n\n"
     "HELP - start here\n"
     "\n"
     "Type a command at Command>, then press Enter.\n"
@@ -323,6 +376,20 @@ typedef struct { int code; char name[24], action[256]; } Binding;
 static Binding binds[MAX_BINDINGS];
 static size_t bind_count;
 static char binds_page[16384];
+/* Explicitly invoked, user-owned command definitions. None execute on load. */
+#define USER_CMD_MAX 32
+#define USER_CMD_NAME 32
+#define USER_CMD_BODY 2048
+#define SCRIPT_STEP_MAX 200
+#define SCRIPT_DEPTH_MAX 8
+typedef struct { char name[USER_CMD_NAME], body[USER_CMD_BODY]; } UserCommand;
+static UserCommand user_commands[USER_CMD_MAX];
+static size_t user_command_count;
+static struct stat user_commands_version;
+static bool user_commands_version_valid, user_commands_loaded;
+static unsigned script_steps, script_depth;
+static bool external_cancel_notice;
+
 
 static bool reserve(Buffer *b, size_t n)
 {
@@ -350,6 +417,31 @@ static bool copy_buffer(Buffer *b, const char *s, size_t n)
     if (n) memcpy(b->s, s, n);
     b->s[n] = 0; b->n = n;
     return true;
+}
+
+/* Allocate exactly the joined strings, including the terminator. Size
+ * arithmetic is checked before allocation; there is no truncating result. */
+static char *join_strings(const char *a, const char *b, const char *c)
+{
+    size_t na = strlen(a), nb = strlen(b), nc = strlen(c);
+    char *out;
+    if (na > SIZE_MAX - nb - 1 || nc > SIZE_MAX - na - nb - 1) {
+        errno = EOVERFLOW; return NULL;
+    }
+    out = malloc(na + nb + nc + 1);
+    if (out) {
+        memcpy(out, a, na); memcpy(out + na, b, nb);
+        memcpy(out + na + nb, c, nc + 1);
+    }
+    return out;
+}
+
+/* Signal handlers only set flags. A syscall can return success after a
+ * handler ran; staged writes must check again before publishing a file. */
+static bool io_cancelled(void)
+{
+    if (terminated || suspended || interrupted) { errno = EINTR; return true; }
+    return false;
 }
 
 static void tell(const char *format, ...)
@@ -1205,7 +1297,8 @@ static const char *const command_sections[] = {
 #define COMMAND_SECTION_COUNT (sizeof command_sections / sizeof command_sections[0])
 static const CommandHelp command_info[] = {
     {"write", "save, w", "write [FILE|-]",
-     "Save or prompt for a name; write FILE switches the active file after saving. Confirm before replacing an existing other file. write - sends the document to redirected stdout.",
+     "Save or prompt for a name; write FILE switches the active file after saving. Confirm "
+     "before replacing an existing other file. write - sends the document to redirected stdout.",
      0, "Save the active file, or save under a new name.",
      "write\n"
      "  Save this file; an unnamed document asks for a filename.\n"
@@ -1214,12 +1307,43 @@ static const CommandHelp command_info[] = {
      "write -\n"
      "  Send exact document bytes to redirected stdout."},
     {"read", "open, editfile", "read [FILE]",
-     "Open another file, refusing to discard unsaved changes. Tab completes paths; Tab on a directory lists its entries.",
+     "Open another file, refusing to discard unsaved changes. Tab completes paths; Tab on a "
+     "directory lists its entries.",
      0, "Open another file after saving your current work.",
      "read\n"
      "  Ask which file to open; Tab completes filenames.\n"
      "read notes.txt\n"
      "  Open notes.txt. Save unsaved edits before changing files."},
+    {"shell", "insert-output, capture", "shell COMMAND",
+     "Explicitly run /bin/sh -c COMMAND and insert its stdout at the cursor as ONE undo "
+     "step. With no arguments, opens a Shell> prompt. Stderr and exit status are reported "
+     "separately. Failed, binary/control, oversized, or interrupted output leaves text intact. "
+     "Commands run as the current OS user, including root when editor is root.",
+     2, "Insert plain-text stdout from a shell command at the cursor.",
+     "shell ls -1\n"
+     "  Insert a directory listing where the cursor is.\n"
+     "shell date\n"
+     "  Insert a timestamp. Undo reverts the insertion.\n"
+     "shell\n"
+     "  Open Shell> and type the command there."},
+    {"filter", "pipe-document", "filter COMMAND",
+     "Feed the whole document to /bin/sh -c COMMAND via stdin and replace the document "
+     "with captured stdout as one undo step. Nonzero exit, invalid output, or cancellation "
+     "leaves the original document unchanged. Use filter-lines for numbered portions.",
+     2, "Send the whole document through a shell filter, undoably.",
+     "filter sort\n"
+     "  Sort all lines of the document.\n"
+     "filter sed 's/a/b/g'\n"
+     "  Transform all lines; undo restores the original."},
+    {"filter-lines", "filter-range", "filter-lines FIRST[-LAST] COMMAND",
+     "Send the specified complete line or numbered inclusive range through a command. "
+     "Only that range is replaced. Results use the document newline style; stdout may "
+     "be empty. Entire replacement is one undoable edit.",
+     2, "Filter only a numbered line or range.",
+     "filter-lines 3 sort\n"
+     "  Filter line 3.\n"
+     "filter-lines 3-9 sort -u\n"
+     "  Sort and deduplicate lines 3 through 9."},
     {"ls", "dir, files, directory", "ls [DIRECTORY]",
      "Browse directory entries in a scrollable viewer. Defaults to the current directory.",
      0, "Look at the files in a directory without leaving editor.",
@@ -1228,7 +1352,10 @@ static const CommandHelp command_info[] = {
      "ls ~/Documents/\n"
      "  List Documents in your home directory."},
     {"clipboard", "clip, cb, cboard, editclip", "clipboard [SLOT|default|list]",
-     "With no argument, toggle editing the selected clipboard. clipboard 2 selects named slot 2; clipboard default selects clipboard.txt; clipboard list shows slots. Copy/cut go to the selected slot, but paste 2 reads slot 2 directly. Slot selection persists. The slot name selected is reserved for internal state.",
+     "With no argument, toggle editing the selected clipboard. clipboard 2 selects named slot "
+     "2; clipboard default selects clipboard.txt; clipboard list shows slots. Copy/cut go to "
+     "the selected slot, but paste 2 reads slot 2 directly. Slot selection persists. The slot "
+     "name selected is reserved for internal state.",
      3, "Edit the clipboard, return to the document, or select a slot.",
      "clipboard\n"
      "  Open the selected clipboard for editing.\n"
@@ -1241,7 +1368,8 @@ static const CommandHelp command_info[] = {
      "clipboard list\n"
      "  Show saved clipboard slots."},
     {"copy", "yank, copyline", "copy [LINE|FIRST-LAST]",
-     "Copy complete lines to the selected clipboard without changing the document. A number after copy is a LINE number, not a clipboard slot.",
+     "Copy complete lines to the selected clipboard without changing the document. A number "
+     "after copy is a LINE number, not a clipboard slot.",
      3, "Copy lines without removing them.",
      "copy\n"
      "  Copy the current line to the selected clipboard.\n"
@@ -1252,7 +1380,8 @@ static const CommandHelp command_info[] = {
      "clipboard 2\n"
      "  Select clipboard 2 for subsequent copy or cut commands."},
     {"cut", "cutline, movelines", "cut [LINE|FIRST-LAST]",
-     "Copy complete lines to the selected clipboard, then delete them in one undoable edit. Numeric arguments are line numbers, not clipboard slots.",
+     "Copy complete lines to the selected clipboard, then delete them in one undoable edit. "
+     "Numeric arguments are line numbers, not clipboard slots.",
      3, "Move lines to the clipboard and remove them here.",
      "cut\n"
      "  Cut the current line into the selected clipboard.\n"
@@ -1261,7 +1390,8 @@ static const CommandHelp command_info[] = {
      "cut 6-9\n"
      "  Cut lines 6 through 9. undo restores the removed text."},
     {"paste", "put, insertclip", "paste [SLOT|default]",
-     "Insert lines from the selected clipboard, or paste 2 from slot 2, without changing the selected slot. Each paste is one undoable edit.",
+     "Insert lines from the selected clipboard, or paste 2 from slot 2, without changing the "
+     "selected slot. Each paste is one undoable edit.",
      3, "Insert clipboard contents before the current line.",
      "paste\n"
      "  Insert from the selected clipboard.\n"
@@ -1269,17 +1399,19 @@ static const CommandHelp command_info[] = {
      "  Insert from clipboard 2; the selected slot stays unchanged.\n"
      "undo\n"
      "  Remove this paste."},
-    {"cliphistory", "clipboard-history, clips", "cliphistory [on|off]",
-     "Browse saved prior contents across clipboard slots; enable/disable persistent history (off by default, max 64 snapshots).",
-     3, "Browse saved clipboard contents or enable their history.",
-     "cliphistory on\n"
-     "  Keep up to 64 older clipboard snapshots.\n"
+    {"cliphistory", "clipboard-history, clips", "cliphistory",
+     "Browse saved prior clipboard contents. This never changes the history setting. Use "
+     "toggle-cliphistory to switch collection on/off; existing snapshots remain when off.",
+     3, "Browse earlier clipboard contents without changing settings.",
      "cliphistory\n"
-     "  View available snapshots.\n"
-     "cliphistory off\n"
-     "  Stop collecting snapshots; already saved ones remain."},
+     "  View saved clipboard snapshots.\n"
+     "clipuse 1\n"
+     "  Restore the newest snapshot.\n"
+     "toggle-cliphistory\n"
+     "  Switch collection on/off and save the setting."},
     {"clipuse", "restoreclip, clipboard-use", "clipuse [NUMBER]",
-     "Restore a numbered saved clipboard entry (1 is newest), archiving the previous clipboard when history is enabled.",
+     "Restore a numbered saved clipboard entry (1 is newest), archiving the previous clipboard "
+     "when history is enabled.",
      3, "Restore a numbered snapshot from clipboard history.",
      "cliphistory\n"
      "  See the available snapshot numbers first.\n"
@@ -1288,7 +1420,8 @@ static const CommandHelp command_info[] = {
      "clipuse\n"
      "  Ask for a snapshot number."},
     {"dline", "delline, delete-line, delete, remove-line", "dline [LINE|FIRST-LAST]",
-     "Delete a line or inclusive range. Also: COUNT dline deletes COUNT lines from the cursor. One undo step.",
+     "Delete a line or inclusive range. Also: COUNT dline deletes COUNT lines from the cursor. "
+     "One undo step.",
      2, "Delete the current line or a range of numbered lines.",
      "dline\n"
      "  Delete the current line.\n"
@@ -1299,7 +1432,8 @@ static const CommandHelp command_info[] = {
      "undo\n"
      "  Restore the deleted text."},
     {"deleol", "deltoeol, delete-to-eol, delete-eol, delendline", "deleol",
-     "Delete text from cursor through end of this line, preserving LF/CRLF line separator. One undo step.",
+     "Delete text from cursor through end of this line, preserving LF/CRLF line separator. One "
+     "undo step.",
      2, "Delete from the cursor to the end of this line.",
      "deleol\n"
      "  Remove the rest of this line, keeping its line break.\n"
@@ -1341,7 +1475,8 @@ static const CommandHelp command_info[] = {
      "reverse\n"
      "  Browse those states while viewing the document."},
     {"reverse", "logbrowser, undomode, undo-mode, browse-undo, browse-history", "reverse [INDEX]",
-     "Browse the undo chain with Left/h/</- and Right/l/>/+ (one step per repeated key); INDEX jumps to an exact state (0 is oldest). Esc exits without saving.",
+     "Browse the undo chain with Left/h/</- and Right/l/>/+ (one step per repeated key); INDEX "
+     "jumps to an exact state (0 is oldest). Esc exits without saving.",
      4, "Browse earlier and later versions of your text.",
      "reverse\n"
      "  Enter the undo browser. - goes back; + goes forward.\n"
@@ -1351,7 +1486,9 @@ static const CommandHelp command_info[] = {
      "  Go to history state 12, if it exists.\n"
      "Esc leaves the browser. write saves the displayed version."},
     {"find", "search, locate", "find [TEXT]",
-     "Search for literal, case-sensitive text from the current cursor (inclusive), wrapping at the end. Without TEXT, open a Find> prompt that preserves every space, including a search made only of spaces. This does not change the document.",
+     "Search for literal, case-sensitive text from the current cursor (inclusive), wrapping at "
+     "the end. Without TEXT, open a Find> prompt that preserves every space, including a "
+     "search made only of spaces. This does not change the document.",
      1, "Find text in the document.",
      "find\n"
      "  Ask what to search for.\n"
@@ -1365,14 +1502,16 @@ static const CommandHelp command_info[] = {
      "next\n"
      "  Move to its next match. n does the same thing."},
     {"prev", "p, previous, findprev, prevmatch, previousmatch, find-prev, previousfind", "prev",
-     "Find the previous occurrence of remembered search text before the cursor, wrapping at the beginning.",
+     "Find the previous occurrence of remembered search text before the cursor, wrapping at "
+     "the beginning.",
      1, "Go to the previous search match.",
      "prev\n"
      "  Move back to the previous match of your last search.\n"
      "p\n"
      "  Same as prev."},
     {"replace", "substitute, change-text", "replace [OLD => NEW]",
-     "Replace the first match from cursor, wrapping. With no arguments prompt for search and replacement. One undo step.",
+     "Replace the first match from cursor, wrapping. With no arguments prompt for search and "
+     "replacement. One undo step.",
      1, "Find and replace one occurrence.",
      "replace\n"
      "  Ask for search text, then replacement text.\n"
@@ -1381,7 +1520,8 @@ static const CommandHelp command_info[] = {
      "undo\n"
      "  Reverse that replacement. Use prompts for an empty replacement."},
     {"replaceall", "replace-all, substituteall", "replaceall [OLD => NEW]",
-     "Replace all non-overlapping literal matches in a single undoable operation. Prompts when omitted.",
+     "Replace all non-overlapping literal matches in a single undoable operation. Prompts when "
+     "omitted.",
      1, "Replace every occurrence in one undoable change.",
      "replaceall\n"
      "  Ask for search text and replacement text.\n"
@@ -1447,51 +1587,89 @@ static const CommandHelp command_info[] = {
      "pagedown\n"
      "  Move down a page without modifying the document."},
     {"movement", "move, navigation", "movement",
-     "Navigate without typing: arrows/hjkl, p/n/b/f, Ctrl-P/N/B/F, 0/$, a/e, g/G, y/v and w/@. Enter or the edit command resumes text entry. Set startup=movement in editor/config for future launches, or use --movement.",
+     "Navigate without typing. Enter or edit resumes text entry. toggle-startup changes the "
+     "saved launch preference, not the current mode.",
      6, "Navigate without accidentally typing into the document.",
      "movement\n"
      "  Use arrows or hjkl to navigate. Enter resumes typing.\n"
-     "For future launches, put startup=movement in editor/config.\n"
-     "From the shell: editor --movement notes.txt"},
+     "toggle-startup\n"
+     "  Switch how future sessions start; this session does not change."},
     {"edit", "editmode, insertmode, typing", "edit",
-     "Resume ordinary text entry. The movement command enables navigation-only control. Set startup=edit in editor/config for future launches, or use --edit. No user hotkeys are installed.",
+     "Resume ordinary text entry. movement enables navigation-only control. Neither command "
+     "changes saved settings.",
      6, "Return to ordinary typing.",
-     "edit\n"
-     "  Leave movement mode and resume text entry.\n"
-     "For future launches, put startup=edit in editor/config."},
-    {"menu", "options", "menu",
-     "Make Esc open the numbered/arrow menu.",
-     6, "Use the arrow-key and numbered menu for commands.",
-     "menu\n"
-     "  Open the menu; Esc will open it on later use too.\n"
-     "cli\n"
-     "  Make Esc open the command prompt again."},
-    {"cli", "command", "cli",
-     "Make Esc open Command>.",
-     6, "Use typed commands instead of the menu.",
-     "cli\n"
-     "  Make Esc open Command>.\n"
-     "menu\n"
-     "  Switch back to menu-based control."},
-    {"mouse", "pointer", "mouse [on|off|toggle]",
-     "Enable or disable optional mouse input.",
-     6, "Turn optional mouse control on or off.",
-     "mouse on\n"
-     "  Enable mouse control.\n"
-     "mouse off\n"
-     "  Leave the mouse to the terminal.\n"
-     "mouse\n"
-     "  Toggle the current setting."},
-    {"signals", "signal-controls", "signals [on|off|toggle]",
-     "Report or change optional editor signal handling (off by default). Off: terminal interrupt exits; terminal stop suspends. On: interrupt cancels input instead of exiting; stop still suspends, cancelling a pending confirmation. No key is bound or terminal signal character changed. Save signal_controls=on/off in editor/config for future launches.",
-     6, "Choose terminal interrupt behavior; no hotkeys are assigned.",
-     "signals\n"
-     "  Report the setting. OFF is the default.\n"
-     "signals on\n"
-     "  Interrupt cancels input instead of exiting.\n"
-     "signals off\n"
-     "  Interrupt exits without saving. Stop still suspends.\n"
-     "Save signal_controls=on or off in editor/config for future launches."},
+     "edit\n  Leave movement and resume typing.\nsettings\n  Inspect and change saved preferences."},
+    {"toggle-startup", "", "toggle-startup",
+     "Switch and save the startup preference: Edit or Movement. This reads the latest saved "
+     "choice and does not change the current mode. --movement/--edit overrides it for one "
+     "launch. No arguments.",
+     6, "Switch how future sessions start: Edit or Movement.",
+     "toggle-startup\n"
+     "  Switch the saved startup choice and report the result.\n"
+     "toggle-startup\n"
+     "  Switch it back. The current editing mode never changes.\n"
+     "settings show\n"
+     "  See saved and current settings and the actual config path."},
+    {"toggle-esc", "toggle-escape", "toggle-esc",
+     "Switch what Esc opens: Command line or Menu. Save first, then apply now. This never "
+     "changes movement/edit mode. One setting, one command, no arguments.",
+     6, "Switch and save Esc behavior: Command line or Menu.",
+     "toggle-esc\n"
+     "  Save the opposite Esc interface and use it now.\n"
+     "toggle-esc\n"
+     "  Switch back. Menu and Command line are values of ONE setting."},
+    {"toggle-mouse", "toggle-pointer", "toggle-mouse",
+     "Switch optional mouse input On/Off, save mouse=on/off in config, and apply now. "
+     "--mouse/--no-mouse overrides one launch without saving. No arguments.",
+     6, "Switch and save optional mouse control: Off or On.",
+     "toggle-mouse\n"
+     "  Switch mouse input and remember the result.\n"
+     "toggle-mouse\n"
+     "  Switch back. Off leaves ordinary selection to your terminal."},
+    {"toggle-signals", "toggle-signal-controls", "toggle-signals",
+     "Switch and save interrupt handling. OFF (default): terminal interrupt exits without "
+     "saving. ON: interrupt cancels pending input. Stop always suspends. No key is bound and "
+     "terminal signal characters are unchanged. No arguments.",
+     6, "Switch and save interrupt behavior: exit or cancel.",
+     "toggle-signals\n"
+     "  Switch OFF/ON and report what Ctrl+C will do.\n"
+     "OFF: interrupt exits WITHOUT SAVING. ON: interrupt cancels input.\n"
+     "Ctrl+Z still suspends. Ctrl+C/Z remain unbound.\n"
+     "settings show\n"
+     "  Inspect saved and current behavior without changing it."},
+    {"toggle-cliphistory", "toggle-clipboard-history", "toggle-cliphistory",
+     "Switch persistent clipboard history On/Off (default Off). On keeps up to 64 snapshots. "
+     "Turning it off retains existing snapshots. Save before changing behavior. No arguments. "
+     "cliphistory only browses history.",
+     6, "Switch and save clipboard history: Off or On.",
+     "toggle-cliphistory\n"
+     "  Start or stop collecting clipboard snapshots.\n"
+     "cliphistory\n"
+     "  Browse existing snapshots without changing the setting.\n"
+     "clipuse 1\n"
+     "  Restore snapshot 1."},
+    {"settings", "options, preferences", "settings [show]",
+     "Open Help > Settings, or use settings show to inspect current/saved values and config "
+     "path. Each switch is one row with its current value. Selecting it runs the matching "
+     "toggle-* command and saves. Startup affects the next launch; Esc, mouse, signals and "
+     "clipboard history apply now. Failed saves leave behavior unchanged. No default command "
+     "hotkeys.",
+     6, "Inspect or change saved preferences in Help > Settings.",
+     "settings\n"
+     "  Open the settings menu; simply opening it changes nothing.\n"
+     "settings show\n"
+     "  See current/saved settings and the actual config path.\n"
+     "toggle-startup\n"
+     "  Switch Edit / Movement for future launches only.\n"
+     "toggle-esc\n"
+     "  Switch Command line / Menu for Esc now and next launch.\n"
+     "toggle-mouse\n"
+     "  Switch mouse Off / On now and next launch.\n"
+     "toggle-signals\n"
+     "  Switch interrupt Exits / Cancels; Ctrl+Z always suspends.\n"
+     "toggle-cliphistory\n"
+     "  Switch saved clipboard history Off / On.\n"
+     "Every toggle takes no arguments. movement and edit affect only this session."},
     {"bind", "key", "bind KEY COMMAND",
      "Create a user-defined hotkey for a built-in command.",
      6, "Optionally assign your own key to a command.",
@@ -1518,6 +1696,47 @@ static const CommandHelp command_info[] = {
      "suspend\n"
      "  Suspend the editor.\n"
      "At the shell, type fg to resume. Unsaved edits stay in memory."},
+    {"define", "def", "define NAME COMMAND",
+     "Save a single-line command definition under NAME; invoke the NAME directly at "
+     "Command>. Use define NAME run FILE to bind it to a multi-line script. "
+     "Names are lowercase ASCII; built-in commands and aliases cannot be replaced. "
+     "Definitions load as inert data; nothing runs on startup.",
+     6, "Assign a saved user-defined name to an editor command.",
+     "define files shell ls -1\n"
+     "  Define files; type files to insert a listing.\n"
+     "define clean run /home/user/clean.editor\n"
+     "  Save a custom script command.\n"
+     "functions\n"
+     "  See all definitions."},
+    {"undefine", "undef, delete-function", "undefine NAME",
+     "Remove a named user command from the persistent commands.conf file. "
+     "Changes are saved atomically; a changed external configuration is not overwritten.",
+     6, "Remove one saved custom command.",
+     "undefine files\n"
+     "  Remove the user-defined files command."},
+    {"functions", "user-commands, definitions", "functions [reload]",
+     "List user-defined commands or reload their secure plaintext definitions from disk. "
+     "Stored in ~/.config/editor/commands.conf (or XDG_CONFIG_HOME/editor). "
+     "Scripts and custom definitions never execute when loaded.",
+     6, "List or reload saved user-defined editor commands.",
+     "functions\n"
+     "  View custom commands and what each runs.\n"
+     "functions reload\n"
+     "  Re-read externally edited definitions."},
+    {"run", "script, source-script", "run FILE",
+     "Explicitly read a plaintext file of editor commands, one per line. Blank "
+     "lines and # comments are ignored. User-owned, non-world-writable regular "
+     "files only; no scripts execute on opening a document. Up to 200 steps "
+     "and 8 levels of nesting. Script commands: shell, filter, filter-lines, "
+     "find, next, prev, goto, top, bottom, undo, redo, movement, edit, run "
+     "and user commands. Each edit remains a separate undo step. "
+     "Stops at the first failing step; earlier steps are not rolled back.",
+     6, "Run an explicitly selected plaintext editor script.",
+     "run ~/myscript.editor\n"
+     "  Run editor commands from a trusted file.\n"
+     "# file contents:\n"
+     "shell date\n"
+     "shell ls -1"},
     {"about", "info", "about",
      "Display version, credits, and warning.",
      7, "Show version, credits and the Bloodguilt Curse notice.",
@@ -1530,7 +1749,8 @@ static const CommandHelp command_info[] = {
      "  Read the full manual. j/k scroll; h/l turn pages.\n"
      "Esc or q closes the viewer."},
     {"help", "?", "help [COMMAND|TOPIC]",
-     "Start with practical command guidance, or see examples, usage and synonyms for one command. A topic searches the command guide.",
+     "Start with practical command guidance, or see examples, usage and synonyms for one "
+     "command. A topic searches the command guide.",
      7, "Get started or learn how to use a command.",
      "help\n"
      "  Read the short starting guide.\n"
@@ -1539,7 +1759,8 @@ static const CommandHelp command_info[] = {
      "help save\n"
      "  See write help through its save synonym."},
     {"list", "commands, cmdlist", "list [TOPIC]",
-     "Browse commands by task, or filter by words in their names, synonyms, descriptions or category. Nothing in the list runs by itself.",
+     "Browse commands by task, or filter by words in their names, synonyms, descriptions or "
+     "category. Nothing in the list runs by itself.",
      7, "Find commands by task, with a short explanation of each.",
      "list\n"
      "  Browse all commands grouped by purpose.\n"
@@ -1548,7 +1769,8 @@ static const CommandHelp command_info[] = {
      "list save\n"
      "  Search names, synonyms, descriptions and topics."},
     {"quit", "exit, q", "quit",
-     "Leave if there are no unsaved changes, then print the Bloodguilt Curse notice to the terminal without pausing. Forced and confirmed quick exits skip the notice.",
+     "Leave if there are no unsaved changes, then print the Bloodguilt Curse notice to the "
+     "terminal without pausing. Forced and confirmed quick exits skip the notice.",
      8, "Leave after your work is saved.",
      "write\n"
      "  Save your work first.\n"
@@ -1670,6 +1892,14 @@ static void command_overview(const char *query, bool keep_draft)
             count++;
         }
     }
+    for (i=0;i<user_command_count;i++)
+        if (!*query || contains_word(user_commands[i].name,query,strlen(query)) ||
+            contains_word(user_commands[i].body,query,strlen(query)) ||
+            !strcasecmp(query,"user") || !strcasecmp(query,"custom")) {
+            if (i==0) guide_append(&used,"\nUser commands\n");
+            guide_append(&used,"  %s\n    Runs: %s\n",user_commands[i].name,user_commands[i].body);
+            count++;
+        }
     if (!count) guide_append(&used,"\nNo matching commands. Try a shorter word,\n"
                                   "or list without a topic to see everything.\n");
     guide_append(&used,"\n%zu command%s. Esc/q returns to Command>.\n",count,count==1?"":"s");
@@ -1687,6 +1917,37 @@ static void command_details(const CommandHelp *info, const char *problem,
                  info->syntax, *info->synonyms ? info->synonyms : "(none)");
     guide_open(problem ? "Check this command" : "How to use this command",command_page,keep_draft);
 }
+/* Names are deliberately not shell names or filenames. Built-ins always win. */
+static int user_command_index(const char *name)
+{
+    size_t i;
+    for (i=0;i<user_command_count;i++)
+        if (!strcasecmp(name,user_commands[i].name)) return (int)i;
+    return -1;
+}
+static bool user_command_name(const char *name)
+{
+    size_t i, n=strlen(name);
+    if (!n || n>=USER_CMD_NAME || name[0]<'a' || name[0]>'z') return false;
+    for (i=1;i<n;i++) if (!((name[i]>='a' && name[i]<='z') ||
+                                (name[i]>='0' && name[i]<='9') ||
+                                name[i]=='_' || name[i]=='-')) return false;
+    return !command_lookup(name);
+}
+static void show_user_commands(bool keep_draft)
+{
+    size_t i, used=0;
+    guide_append(&used,"USER COMMANDS (%zu/%d)\n\n",user_command_count,USER_CMD_MAX);
+    for(i=0;i<user_command_count;i++)
+        guide_append(&used,"  %s = %s\n",user_commands[i].name,user_commands[i].body);
+    if (!user_command_count) guide_append(&used,"(none defined)\n");
+    guide_append(&used,"\ndefine NAME COMMAND   Save a command with a custom name.\n"
+                       "undefine NAME         Remove the named command.\n"
+                       "NAME                  Run its definition explicitly.\n"
+                       "run FILE              Execute a plaintext editor script.\n"
+                       "No commands run automatically when a file is opened.\n");
+    guide_open("User commands",command_page,keep_draft);
+}
 static void command_help(const char *name)
 {
     char topic[COMMAND_SIZE];
@@ -1696,6 +1957,15 @@ static void command_help(const char *name)
     while (n && (name[n-1] == ' ' || name[n-1] == '\t')) n--;
     memcpy(topic,name,n); topic[n]=0;
     info=command_lookup(topic);
+    if (!info && user_command_index(topic)>=0) {
+        size_t used=0;
+        int which=user_command_index(topic);
+        guide_append(&used,"USER COMMAND %s\n\nRuns: %s\n\n"
+                           "Run by typing %s. Use undefine %s to remove.\n"
+                           "Nothing executes while reading this help.\n",
+                     topic,user_commands[which].body,topic,topic);
+        guide_open("Custom command help",command_page,false);return;
+    }
     if (!info) { command_overview(topic,false); return; }
     command_details(info,NULL,false);
 }
@@ -1735,6 +2005,26 @@ static void command_unknown(const char *word)
     size_t i, used=0, n=strlen(word), matches=0;
     guide_append(&used,"Command not found: %s\n\nNothing ran. Esc/q returns to your command\n"
                        "so you can correct it without retyping.\n\n",word);
+    /* Retired settings syntax must not become a hidden toggle alias: an old
+     * explicit "on" command must never unexpectedly switch a setting off. */
+    {
+        static const struct { const char *old_name, *replacement; } renamed[] = {
+            { "startup", "toggle-startup" }, { "startmode", "toggle-startup" },
+            { "startup-mode", "toggle-startup" }, { "toggle-mode", "toggle-esc" },
+            { "toggle-interface", "toggle-esc" }, { "mouse", "toggle-mouse" },
+            { "pointer", "toggle-mouse" }, { "signals", "toggle-signals" },
+            { "signal-controls", "toggle-signals" }
+        };
+        for(i=0;i<sizeof renamed/sizeof renamed[0];i++)
+            if (!strcasecmp(word,renamed[i].old_name)) {
+                guide_append(&used,"Use %s, with NO arguments, to switch and save.\n"
+                             "Use settings show to inspect values without changing them.\n"
+                             "The old form is not executed or silently converted.\n\n",
+                             renamed[i].replacement);
+                matches++;
+                break;
+            }
+    }
     for(i=0;i<COMMAND_INFO_COUNT;i++) {
         const CommandHelp *info=command_info+i;
         if (!strncasecmp(info->name,word,n) ||
@@ -1837,6 +2127,12 @@ static bool allowed_key_command(const char *command_text)
         word[n] = command_text[n]; n++;
     }
     word[n] = 0; info = command_lookup(word);
+    if (!info && user_command_index(word)>=0) {
+        const char *tail=command_text+n;
+        while (*tail==' ' || *tail=='\t') tail++;
+        /* Custom commands are argument-free. No invented key bindings. */
+        return !*tail;
+    }
     /* No bind/unbind from inside another binding. */
     return info && strcmp(info->name,"bind") && strcmp(info->name,"unbind");
 }
@@ -1863,119 +2159,360 @@ static bool binding_assign(const char *name, const char *action)
         i = (int)bind_count++;
     }
     binds[i].code = code;
-    strcpy(binds[i].name, normal);
-    strcpy(binds[i].action, action);
+    /* hotkey_code bounds normal; the action length was checked above. */
+    memcpy(binds[i].name, normal, strlen(normal) + 1);
+    memcpy(binds[i].action, action, strlen(action) + 1);
     return true;
 }
 
+/* Configuration is inert text, not executable code. Readable settings are
+ * fine (0755 directory / 0644 file); other users must not be able to write.
+ * Keep path construction separate so even an unavailable path can be shown. */
+static char *config_filename(const char *leaf)
+{
+    const char *base = getenv("XDG_CONFIG_HOME"), *suffix = "/editor/";
+    size_t a, b, c, n;
+    char *path;
+    if (!base || *base != '/') {
+        base = getenv("HOME"); suffix = "/.config/editor/";
+        if (!base || *base != '/') { errno = EINVAL; return NULL; }
+    }
+    a = strlen(base); b = strlen(suffix); c = strlen(leaf);
+    if (a > SIZE_MAX-b-1 || c > SIZE_MAX-a-b-1) { errno=EOVERFLOW; return NULL; }
+    n=a+b+c+1;
+    path=malloc(n);
+    if (path) {
+        memcpy(path,base,a); memcpy(path+a,suffix,b); memcpy(path+a+b,leaf,c+1);
+    }
+    return path;
+}
 static char *config_path(const char *leaf, bool create)
 {
-    const char *base = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
-    char *work, *result, *q; struct stat st;
-    size_t n;
-    if (!base || *base != '/') {
-        if (!home || *home != '/') return NULL;
-        n = strlen(home) + sizeof "/.config/editor";
-        work = malloc(n);
-        if (!work) return NULL;
-        snprintf(work, n, "%s/.config/editor", home);
-    } else {
-        n = strlen(base) + sizeof "/editor";
-        work = malloc(n);
-        if (!work) return NULL;
-        snprintf(work, n, "%s/editor", base);
-    }
+    char *path=config_filename(leaf), *slash, *q;
+    struct stat st;
+    int error;
+    if (!path) return NULL;
+    slash=strrchr(path,'/'); *slash=0;
     if (create) {
-        for (q = work + 1; *q; q++) if (*q == '/') {
-            *q = 0;
-            if (!private_directory(work)) { free(work); return NULL; }
-            *q = '/';
+        for (q=path+1; *q; q++) if (*q=='/') {
+            *q=0;
+            if (!private_directory(path)) goto failure;
+            *q='/';
         }
-        if (!private_directory(work)) { free(work); return NULL; }
+        if (!private_directory(path)) goto failure;
     }
-    if (lstat(work, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
-        (st.st_mode & 077)) { free(work); return NULL; }
-    result = malloc(strlen(work) + strlen(leaf) + 2);
-    if (result) sprintf(result, "%s/%s", work, leaf);
-    free(work); return result;
+    if (lstat(path,&st)<0) goto failure;
+    if (!S_ISDIR(st.st_mode) || st.st_uid!=geteuid() || (st.st_mode & 022)) {
+        errno=EACCES; goto failure;
+    }
+    *slash='/'; return path;
+failure:
+    error=errno; free(path); errno=error ? error : EACCES; return NULL;
 }
-
 static char *keymap_path(bool create)
 {
     return config_path("keys.conf", create);
 }
 
-/* Bounded, inert configuration text. Refuse special files, links, NUL bytes,
- * writable-by-others files and files changing during the read. Never execute
- * shell text. 0 means absent, 1 loaded, -1 invalid/unavailable. */
+/* Bounded, inert configuration. Refuse special files, links, NUL bytes,
+ * foreign/writable-by-others files and files changing during the read.
+ * 0 means absent, 1 loaded, -1 invalid/unavailable (with a useful errno). */
+static int read_config_file(const char *path, Buffer *b, struct stat *seen)
+{
+    char chunk[1024];
+    struct stat before, after;
+    int fd, result=-1, error=0;
+    ssize_t n;
+    b->n=0;
+    fd=open(path,O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+    if (fd<0) return errno==ENOENT ? 0 : -1;
+    if (fstat(fd,&before)<0) goto done;
+    if (!S_ISREG(before.st_mode)) { errno=EINVAL; goto done; }
+    if (before.st_uid!=geteuid() || (before.st_mode & 022)) { errno=EACCES; goto done; }
+    if (before.st_size<0 || before.st_size>(off_t)CONFIG_LIMIT) { errno=EFBIG; goto done; }
+    for (;;) {
+        if (terminated || interrupted || suspended) { errno=EINTR; goto done; }
+        n=read(fd,chunk,sizeof chunk);
+        if (n<0 && errno==EINTR) continue;
+        if (n<0) goto done;
+        if (!n) break;
+        if ((size_t)n>CONFIG_LIMIT-b->n) { errno=EFBIG; goto done; }
+        if (memchr(chunk,0,(size_t)n)) { errno=EILSEQ; goto done; }
+        if (!reserve(b,b->n+(size_t)n+1)) goto done;
+        memcpy(b->s+b->n,chunk,(size_t)n); b->n+=(size_t)n;
+    }
+    if (!reserve(b,b->n+1) || fstat(fd,&after)<0) goto done;
+    if (!same_disk_version(&before,&after)) { errno=EAGAIN; goto done; }
+    b->s[b->n]=0;
+    if (seen) *seen=after;
+    result=1;
+done:
+    error=errno;
+    if (close(fd)<0 && result==1) { result=-1; error=errno; }
+    errno=error;
+    return result;
+}
 static int read_config(const char *leaf, Buffer *b)
 {
-    char *path = config_path(leaf, false), chunk[1024];
-    struct stat before, after;
-    int fd = -1, result = -1;
-    ssize_t n;
-    if (!path) return 0;
-    fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
-    free(path);
-    if (fd < 0) return errno == ENOENT ? 0 : -1;
-    if (fstat(fd, &before) < 0 || !S_ISREG(before.st_mode) ||
-        before.st_uid != geteuid() || (before.st_mode & 022) ||
-        before.st_size < 0 || before.st_size > 32768) goto done;
-    for (;;) {
-        if (terminated || interrupted || suspended) goto done;
-        n = read(fd, chunk, sizeof chunk);
-        if (n < 0 && errno == EINTR) continue;
-        if (n < 0) goto done;
-        if (!n) break;
-        if ((size_t)n > 32768 - b->n || memchr(chunk, 0, (size_t)n) ||
-            !reserve(b, b->n + (size_t)n + 1)) goto done;
-        memcpy(b->s + b->n, chunk, (size_t)n); b->n += (size_t)n;
-    }
-    if (!reserve(b, b->n + 1) || fstat(fd, &after) < 0 ||
-        !same_disk_version(&before, &after)) goto done;
-    b->s[b->n] = 0;
-    result = 1;
-done:
-    if (close(fd) < 0) result = -1;
+    char *path=config_path(leaf,false);
+    int result, error;
+    if (!path) return errno==ENOENT ? 0 : -1;
+    result=read_config_file(path,b,NULL); error=errno;
+    free(path); errno=error;
     return result;
 }
 
+typedef struct { const char *key, *value; size_t key_n, value_n; } ConfigField;
+typedef struct { bool movement, signals, esc_menu, mouse, warning; } ConfigSettings;
+/* Slice a line without changing its bytes. The writer can preserve comments,
+ * spacing, unknown settings and LF/CRLF while replacing just the value. */
+static ConfigField config_field(const char *s, size_t n)
+{
+    ConfigField f={NULL,NULL,0,0};
+    const char *end=s+n, *eq, *hash=memchr(s,'#',n), *key_end;
+    if (hash) end=hash;
+    while (s<end && isspace((unsigned char)*s)) s++;
+    while (end>s && isspace((unsigned char)end[-1])) end--;
+    if (s==end) return f;
+    eq=memchr(s,'=',(size_t)(end-s)); key_end=eq ? eq : end;
+    while (key_end>s && isspace((unsigned char)key_end[-1])) key_end--;
+    f.key=s; f.key_n=(size_t)(key_end-s);
+    if (eq) {
+        f.value=eq+1;
+        while (f.value<end && isspace((unsigned char)*f.value)) f.value++;
+        f.value_n=(size_t)(end-f.value);
+    }
+    return f;
+}
+static bool config_word(const char *s, size_t n, const char *word)
+{
+    return s && n==strlen(word) && !memcmp(s,word,n);
+}
+static ConfigSettings parse_config(const Buffer *b)
+{
+    ConfigSettings settings={0};
+    size_t at=0;
+    while (at<b->n) {
+        const char *line=b->s+at, *lf=memchr(line,'\n',b->n-at);
+        size_t n=lf ? (size_t)(lf-line)+1 : b->n-at;
+        ConfigField f=config_field(line,n);
+        if (f.key) {
+            bool is_startup=config_word(f.key,f.key_n,"startup");
+            bool is_signals=config_word(f.key,f.key_n,"signal_controls");
+            if (is_startup && config_word(f.value,f.value_n,"movement")) settings.movement=true;
+            else if (is_startup && config_word(f.value,f.value_n,"edit")) settings.movement=false;
+            else if (is_signals && config_word(f.value,f.value_n,"on")) settings.signals=true;
+            else if (is_signals && config_word(f.value,f.value_n,"off")) settings.signals=false;
+            else if (config_word(f.key,f.key_n,"esc") && config_word(f.value,f.value_n,"menu")) settings.esc_menu=true;
+            else if (config_word(f.key,f.key_n,"esc") && config_word(f.value,f.value_n,"cli")) settings.esc_menu=false;
+            else if (config_word(f.key,f.key_n,"mouse") && config_word(f.value,f.value_n,"on")) settings.mouse=true;
+            else if (config_word(f.key,f.key_n,"mouse") && config_word(f.value,f.value_n,"off")) settings.mouse=false;
+            else settings.warning=true;
+        }
+        at+=n;
+    }
+    return settings;
+}
+static ConfigSettings startup_settings(void)
+{
+    Buffer b={0};
+    ConfigSettings settings={0};
+    int result=read_config("config",&b);
+    startup_config_error=result<0 ? errno : 0;
+    if (result==1) settings=parse_config(&b);
+    startup_config_warning=result<0 || settings.warning;
+    if (result>=0) {
+        startup_movement=settings.movement;
+        startup_esc_menu=settings.esc_menu;
+        startup_signals=settings.signals;
+        startup_mouse=settings.mouse;
+    }
+    free(b.s); return settings;
+}
 static void load_startup_config(void)
 {
-    Buffer b = {0};
-    int result = read_config("config", &b);
-    char *line = b.s;
-    if (result < 0) startup_config_warning = true;
-    while (result == 1 && line && *line) {
-        char *next = strchr(line, '\n'), *end, *value;
-        if (next) *next++ = 0;
-        while (*line == ' ' || *line == '\t') line++;
-        end = strchr(line, '#');
-        if (end) *end = 0;
-        end = line + strlen(line);
-        while (end > line && isspace((unsigned char)end[-1])) *--end = 0;
-        if (*line) {
-            value = strchr(line, '=');
-            if (!value) startup_config_warning = true;
-            else {
-                *value++ = 0;
-                end = line + strlen(line);
-                while (end > line && isspace((unsigned char)end[-1])) *--end = 0;
-                while (*value == ' ' || *value == '\t') value++;
-                if (!strcmp(line, "startup")) {
-                    if (!strcmp(value, "movement")) movement_mode = true;
-                    else if (!strcmp(value, "edit")) movement_mode = false;
-                    else startup_config_warning = true;
-                } else if (!strcmp(line, "signal_controls")) {
-                    if (!strcmp(value, "on")) signal_controls = 1;
-                    else if (!strcmp(value, "off")) signal_controls = 0;
-                    else startup_config_warning = true;
-                } else startup_config_warning = true;
-            }
-        }
-        line = next;
+    ConfigSettings settings=startup_settings();
+    movement_mode=settings.movement;
+    signal_controls=settings.signals;
+    menu_preferred=settings.esc_menu;
+    mouse_enabled=settings.mouse;
+}
+static bool config_append(Buffer *b, const char *s, size_t n)
+{
+    if (b->n>CONFIG_LIMIT || n>CONFIG_LIMIT-b->n) { errno=EFBIG; return false; }
+    if (!reserve(b,b->n+n+1)) return false;
+    if (n) memcpy(b->s+b->n,s,n);
+    b->n+=n; b->s[b->n]=0; return true;
+}
+enum { SETTING_STARTUP, SETTING_ESC, SETTING_SIGNALS, SETTING_MOUSE,
+       SETTING_CLIPHISTORY, SETTING_COUNT };
+/* One registry identifies every persistent switch. Menus use the same
+ * commands as typed input; toggles never accept an on/off sub-language. */
+typedef struct {
+    const char *command, *label, *key, *on, *off;
+} SettingToggle;
+static const SettingToggle setting_toggles[SETTING_COUNT] = {
+    { "toggle-startup", "Startup", "startup", "movement", "edit" },
+    { "toggle-esc", "Esc", "esc", "menu", "cli" },
+    { "toggle-signals", "Signal handling", "signal_controls", "on", "off" },
+    { "toggle-mouse", "Mouse", "mouse", "on", "off" },
+    { "toggle-cliphistory", "Clipboard history", NULL, "on", "off" }
+};
+static int setting_toggle_index(const char *command_name)
+{
+    int i;
+    if (command_name) for (i=0;i<SETTING_COUNT;i++)
+        if (!strcmp(command_name,setting_toggles[i].command)) return i;
+    return -1;
+}
+static bool setting_enabled(int kind)
+{
+    switch (kind) {
+    case SETTING_STARTUP: return startup_movement;
+    case SETTING_ESC: return menu_preferred;
+    case SETTING_SIGNALS: return signal_controls!=0;
+    case SETTING_MOUSE: return mouse_enabled;
+    case SETTING_CLIPHISTORY: return clip_history_enabled;
+    default: return false;
     }
-    free(b.s);
+}
+/* Change one preference, not the document or the rest of the config. Startup
+ * toggles the fresh on-disk value. Esc and signal callers supply the
+ * opposite of their live setting. Do not change live behavior until the
+ * replacement succeeds. This one writer preserves other settings/comments. */
+static bool save_preference(int kind, int choice)
+{
+    char *path=NULL, *tmp=NULL, *dir=NULL, *slash;
+    Buffer old={0}, out={0};
+    ConfigSettings settings;
+    struct stat seen, now, directory;
+    int result, error=0, fd=-1, dfd=-1;
+    bool ok=false, found=false, mode, previous;
+    size_t at=0;
+    const char *value, *key, *on, *off, *ending="\n";
+    if (kind<0 || kind>=SETTING_COUNT || !setting_toggles[kind].key) {
+        errno=EINVAL; return false;
+    }
+    key=setting_toggles[kind].key;
+    on=setting_toggles[kind].on;
+    off=setting_toggles[kind].off;
+    startup_sync_warning=false;
+    path=config_path("config",true);
+    if (!path) goto done;
+    result=read_config_file(path,&old,&seen);
+    if (result<0) goto done;
+    if (result && seen.st_nlink!=1) { errno=EMLINK; goto done; }
+    settings=parse_config(&old);
+    previous=kind==SETTING_STARTUP ? settings.movement :
+             kind==SETTING_ESC ? settings.esc_menu :
+             kind==SETTING_SIGNALS ? settings.signals : settings.mouse;
+    mode=choice<0 ? !previous : choice!=0;
+    value=mode ? on : off;
+    while (at<old.n) {
+        const char *line=old.s+at, *lf=memchr(line,'\n',old.n-at);
+        size_t n=lf ? (size_t)(lf-line)+1 : old.n-at;
+        ConfigField f=config_field(line,n);
+        if (!at && lf && lf>line && lf[-1]=='\r') ending="\r\n";
+        if (f.value && config_word(f.key,f.key_n,key)) {
+            size_t prefix=(size_t)(f.value-line);
+            if (!config_append(&out,line,prefix) ||
+                !config_append(&out,value,strlen(value)) ||
+                !config_append(&out,f.value+f.value_n,n-prefix-f.value_n)) goto done;
+            found=true;
+        } else if (!config_append(&out,line,n)) goto done;
+        at+=n;
+    }
+    if (!found) {
+        if ((out.n && out.s[out.n-1]!='\n' && !config_append(&out,ending,strlen(ending))) ||
+            !config_append(&out,key,strlen(key)) || !config_append(&out,"=",1) || !config_append(&out,value,strlen(value)) ||
+            !config_append(&out,ending,strlen(ending))) goto done;
+    }
+    /* Repeating a saved preference need not rewrite or change its metadata. */
+    if (same_bytes(&old,&out)) { ok=true; goto committed; }
+    if (result && !(seen.st_mode & S_IWUSR)) { errno=EACCES; goto done; }
+    dir=strdup(path);
+    if (!dir) goto done;
+    slash=strrchr(dir,'/'); *slash=0;
+    dfd=open(dir,O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dfd<0 || fstat(dfd,&directory)<0) goto done;
+    if (directory.st_uid!=geteuid() || (directory.st_mode & 022)) { errno=EACCES; goto done; }
+    if (strlen(path)>SIZE_MAX-sizeof ".XXXXXX") { errno=EOVERFLOW; goto done; }
+    tmp=malloc(strlen(path)+sizeof ".XXXXXX");
+    if (!tmp) goto done;
+    (void)snprintf(tmp,strlen(path)+sizeof ".XXXXXX","%s.XXXXXX",path);
+    fd=mkstemp(tmp);
+    if (fd<0) { free(tmp); tmp=NULL; goto done; }
+    if (fchmod(fd,0600)<0 || write_all(fd,out.s,out.n)<0 || sync_fd(fd)<0) goto done;
+    if (close(fd)<0) { fd=-1; goto done; }
+    fd=-1;
+    if (terminated || suspended || interrupted) { errno=EINTR; goto done; }
+    if (lstat(dir,&now)<0) goto done;
+    if (!S_ISDIR(now.st_mode) || now.st_dev!=directory.st_dev || now.st_ino!=directory.st_ino ||
+        now.st_uid!=geteuid() || (now.st_mode & 022)) { errno=EAGAIN; goto done; }
+    if (result) {
+        if (lstat(path,&now)<0) goto done;
+        if (!same_disk_version(&seen,&now)) { errno=EAGAIN; goto done; }
+        if (io_cancelled() || rename(tmp,path)<0) goto done;
+    } else if (io_cancelled() || link(tmp,path)<0) goto done; /* Never overwrite a new arrival. */
+    ok=true;
+    /* A committed setting must not be reported as absent if directory sync
+     * fails. Report that durability warning separately; do not roll it back. */
+    if (sync_fd(dfd)<0) startup_sync_warning=true;
+committed:
+    settings=parse_config(&out);
+    startup_movement=settings.movement;
+    startup_esc_menu=settings.esc_menu;
+    startup_signals=settings.signals;
+    startup_mouse=settings.mouse;
+    startup_config_warning=settings.warning;
+    startup_config_error=0;
+done:
+    error=errno;
+    if (fd>=0) close(fd);
+    if (tmp) (void)unlink(tmp);
+    if (dfd>=0) close(dfd);
+    free(tmp); free(dir); free(path); free(old.s); free(out.s);
+    errno=error; return ok;
+}
+static bool save_startup_setting(int choice)
+{
+    return save_preference(SETTING_STARTUP,choice);
+}
+static void show_settings(void)
+{
+    char *path=config_filename("config");
+    size_t used=0;
+    (void)startup_settings();
+    guide_append(&used,"SETTINGS - current and saved\n\nConfig: %s\n\n",
+                 path ? path : "(HOME/XDG_CONFIG_HOME unavailable)");
+    if (startup_config_error)
+        guide_append(&used,"Cannot read saved settings: %s.\nUse a directory owned by you, not writable by other users.\n\n",
+                     strerror(startup_config_error));
+    else guide_append(&used,"Saved startup: %s\nSaved Esc interface: %s\nSaved signal handling: %s\nSaved mouse: %s\n\n",
+                      startup_movement ? "movement" : "edit",
+                      startup_esc_menu ? "Menu" : "Command line",
+                      startup_signals ? "ON (interrupt cancels)" : "OFF (interrupt exits)",
+                      startup_mouse ? "On" : "Off");
+    guide_append(&used,"Current mode: %s\nCurrent Esc interface: %s\nCurrent signal handling: %s\nCurrent mouse: %s\nClipboard history: %s\n\n"
+                 "Every toggle switches one choice and saves it. No arguments.\n"
+                 "toggle-startup      Next launch: Edit / Movement.\n"
+                 "toggle-esc          Esc opens: Command line / Menu.\n"
+                 "toggle-mouse        Mouse: Off / On.\n"
+                 "toggle-signals      Interrupt: exits / cancels input.\n"
+                 "toggle-cliphistory  Keep clipboard history: Off / On.\n\n"
+                 "Only toggle-startup waits for the next launch. The others apply now.\n"
+                 "movement / edit changes the CURRENT mode, without saving.\n"
+                 "--movement/--edit, --menu/--cli and --mouse/--no-mouse override one launch.\n"
+                 "Clipboard history is saved with clipboard data; existing snapshots remain when off.\n"
+                 "Ctrl+C/Z are never bound. With signals off, Ctrl+C exits WITHOUT SAVING.\n"
+                 "Ctrl+Z suspends either way.\n"
+                 "settings opens Help > Settings. Esc/q returns to Command>.\n",
+                 movement_mode ? "movement" : "edit", menu_preferred ? "Menu" : "Command line",
+                 signal_controls ? "ON (interrupt cancels)" : "OFF (interrupt exits)",
+                 mouse_enabled ? "On" : "Off",clip_history_enabled ? "On" : "Off");
+    if (startup_config_warning && !startup_config_error)
+        guide_append(&used,"\nSome unrecognized/invalid config entries were ignored.\n");
+    free(path); guide_open("Settings",command_page,false);
 }
 
 static void load_bindings(void)
@@ -2012,17 +2549,17 @@ static bool save_bindings(void)
     size_t i;
     int fd = -1, dir_fd;
     struct stat st;
-    bool ok = false;
+    bool ok = false, temporary_created = false;
     if (!path) return false;
     if (lstat(path, &st) == 0) {
         if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077))
             goto done;
     } else if (errno != ENOENT) goto done;
-    tmp = malloc(strlen(path) + 16);
+    tmp = join_strings(path, ".XXXXXX", "");
     if (!tmp) goto done;
-    sprintf(tmp, "%s.XXXXXX", path);
     fd = mkstemp(tmp);
     if (fd < 0) goto temp_done;
+    temporary_created = true;
     if (fchmod(fd, 0600) < 0 ||
         write_all(fd, "# editor user-defined keys; no built-in hotkeys\n",
                   strlen("# editor user-defined keys; no built-in hotkeys\n")) < 0) goto temp_done;
@@ -2036,7 +2573,7 @@ static bool save_bindings(void)
     if (sync_fd(fd) < 0) goto temp_done;
     if (close(fd) < 0) { fd = -1; goto temp_done; }
     fd = -1;
-    if (rename(tmp, path) < 0) goto temp_done;
+    if (io_cancelled() || rename(tmp, path) < 0) goto temp_done;
     { char *slash = strrchr(path, '/');
       if (slash) {
           *slash = 0; dir_fd = open(path, O_RDONLY);
@@ -2046,8 +2583,12 @@ static bool save_bindings(void)
     }
     ok = true;
 temp_done:
-    if (fd >= 0) close(fd);
-    if (!ok) unlink(tmp);
+    { int error = errno;
+      if (fd >= 0) close(fd);
+      /* A failed mkstemp transfers no file, even if it changed the template. */
+      if (!ok && temporary_created) (void)unlink(tmp);
+      errno = error;
+    }
     free(tmp);
 done:
     free(path);
@@ -2306,7 +2847,7 @@ static bool journal_save(void)
     JournalOutput out = {0};
     int fd = -1, dir_fd = -1, old_fd = -1;
     struct stat st, written, check;
-    bool ok = false, old_present = false;
+    bool ok = false, old_present = false, temporary_created = false;
     if (!path) return false;
     path_n = strlen(filename);
     if (path_n > 16384 || text.n > LIMIT) goto done;
@@ -2332,11 +2873,11 @@ static bool journal_save(void)
                       !same_disk_version(&loaded_journal_stat, &st);
     } else if (errno != ENOENT) goto done;
     if (old_fd >= 0) { close(old_fd); old_fd = -1; }
-    tmp = malloc(strlen(path) + 24);
+    tmp = join_strings(path, ".XXXXXX", "");
     if (!tmp) goto done;
-    snprintf(tmp, strlen(path) + 24, "%s.XXXXXX", path);
     fd = mkstemp(tmp);
     if (fd < 0) goto done;
+    temporary_created = true;
     out.fd = fd; out.hash = JOURNAL_HASH_INITIAL;
     if (fchmod(fd, 0600) < 0 || journal_write(&out, "EDUNDO02", 8) < 0 ||
         journal_number(&out, (uint64_t)path_n) < 0 ||
@@ -2366,6 +2907,7 @@ static bool journal_save(void)
             errno = EAGAIN; goto done;
         }
     }
+    if (io_cancelled()) goto done;
     if (archive_old) {
         archived = malloc(strlen(path) + 80);
         if (!archived) goto done;
@@ -2382,6 +2924,7 @@ static bool journal_save(void)
             if (!archived_linked) { errno = EEXIST; goto done; }
         }
     }
+    if (io_cancelled()) goto done;
     if (old_present) {
         if (rename(tmp, path) < 0) goto done;
     } else {
@@ -2413,11 +2956,14 @@ static bool journal_save(void)
     journal_rebased = false;
     ok = true;
 done:
-    if (dir_fd >= 0) close(dir_fd);
-    if (old_fd >= 0) close(old_fd);
-    if (fd >= 0) close(fd);
-    if (!ok && tmp) (void)unlink(tmp);
-    if (archived_linked) (void)unlink(archived);
+    { int error = errno;
+      if (dir_fd >= 0) close(dir_fd);
+      if (old_fd >= 0) close(old_fd);
+      if (fd >= 0) close(fd);
+      if (!ok && temporary_created) (void)unlink(tmp);
+      if (archived_linked) (void)unlink(archived);
+      errno = error;
+    }
     free(archived); free(tmp); free(dir); free(path);
     return ok;
 }
@@ -2455,7 +3001,7 @@ static void save_file(const char *name, bool approved)
     struct stat st, check, written;
     bool present, same, other_file, committed = false, outside = false;
     bool clipboard_written = false, warn_history = false, warn_archive = false;
-    bool warn_dirsync = false;
+    bool warn_dirsync = false, temporary_created = false;
     int fd = -1, permission_fd = -1, dir_fd = -1, error;
     mode_t mode, mask;
     if (name && !strcmp(name, "-")) { save_to_stdout(); return; }
@@ -2535,13 +3081,22 @@ static void save_file(const char *name, bool approved)
         mode = editing_clipboard ? 0600 : 0666 & ~mask;
     }
     if (!copy_buffer(&snapshot, text.s, text.n)) { errno = ENOMEM; goto failure; }
-    temporary = malloc(strlen(path) + 32);
-    if (!temporary) goto failure;
-    strcpy(temporary, path);
-    slash = strrchr(temporary, '/');
-    strcpy(slash + 1, ".editor.XXXXXX");
+    /* Only the canonical parent and template are needed, not a copy of
+     * the old basename. Keep slash pointing into the owned allocation. */
+    slash = strrchr(path, '/');
+    if (!slash) { errno = EINVAL; goto failure; }
+    {
+        size_t parent_n = (size_t)(slash - path) + 1;
+        if (parent_n > SIZE_MAX - sizeof ".editor.XXXXXX") { errno = EOVERFLOW; goto failure; }
+        temporary = malloc(parent_n + sizeof ".editor.XXXXXX");
+        if (!temporary) goto failure;
+        memcpy(temporary, path, parent_n);
+        memcpy(temporary + parent_n, ".editor.XXXXXX", sizeof ".editor.XXXXXX");
+        slash = temporary + parent_n - 1;
+    }
     fd = mkstemp(temporary);
     if (fd < 0) goto failure;
+    temporary_created = true;
     if (fstat(fd, &written) < 0) goto failure;
     if (present && (written.st_uid != st.st_uid || written.st_gid != st.st_gid) &&
         fchown(fd, st.st_uid, st.st_gid) < 0) goto failure;
@@ -2562,10 +3117,10 @@ static void save_file(const char *name, bool approved)
             else tell("File now has multiple hard links. Write cancelled.");
             goto done;
         }
-        if (rename(temporary, path) < 0) goto failure;
+        if (io_cancelled() || rename(temporary, path) < 0) goto failure;
     } else {
         /* link() creates the name without replacing a concurrently created file. */
-        if (link(temporary, path) < 0) goto failure;
+        if (io_cancelled() || link(temporary, path) < 0) goto failure;
         (void)unlink(temporary);
     }
     committed = true;
@@ -2610,7 +3165,7 @@ done:
     if (fd >= 0) (void)close(fd);
     if (permission_fd >= 0) (void)close(permission_fd);
     if (dir_fd >= 0) (void)close(dir_fd);
-    if (temporary && !committed) (void)unlink(temporary);
+    if (temporary_created && !committed) (void)unlink(temporary);
     free(path); free(temporary); free(snapshot.s); free(disk.s); free(again.s);
     free_changes(to_outside); free_changes(to_editor);
     /* An ordinary write only saves. A clipboard toggle also returns to the
@@ -2842,9 +3397,9 @@ static void draw_viewer(Buffer *out, Buffer *line)
 /* The root stays short; secondary pages contain every operation.
  * Each row is either an executable command, a parameter prompt, or a subpage.
  * The data table is also the source of menu numbering and mouse hit testing. */
-enum { MENU_ROOT, MENU_FILE, MENU_EDIT, MENU_MOVE, MENU_HISTORY, MENU_CONTROL, MENU_HELP, MENU_EXIT };
+enum { MENU_ROOT, MENU_FILE, MENU_EDIT, MENU_MOVE, MENU_HISTORY, MENU_CONTROL, MENU_HELP, MENU_SETTINGS, MENU_KEYS, MENU_EXIT };
 enum { MENU_COMMAND, MENU_SUBPAGE, MENU_WRITE, MENU_PARAMETER,
-       MENU_MOUSE_TOGGLE, MENU_ESC_TOGGLE, MENU_QUIT_FORCE };
+       MENU_QUIT_FORCE, MENU_MOVEMENT };
 typedef struct {
     const char *label;
     int action;
@@ -2869,8 +3424,6 @@ static const MenuItem menu_file_items[] = {
     ASK("Select clipboard...", "clipboard", "Slot/default> "),
     ITEM("List clipboards", "clipboard list"),
     ITEM("Clipboard history", "cliphistory"),
-    ITEM("History on", "cliphistory on"),
-    ITEM("History off", "cliphistory off"),
     ASK("Restore clip...", "clipuse", "Clip entry #> ")
 };
 /* The clipboard has a shorter file menu; hide entries that cannot operate
@@ -2881,9 +3434,7 @@ static const MenuItem menu_clipboard_items[] = {
     ASK("Switch clipboard...", "clipboard", "Slot/default> "),
     ITEM("List clipboards", "clipboard list"),
     ASK("Browse folder...", "ls", "Folder> "),
-    ITEM("Clipboard history", "cliphistory"),
-    ITEM("History on", "cliphistory on"),
-    ITEM("History off", "cliphistory off")
+    ITEM("Clipboard history", "cliphistory")
 };
 static const MenuItem menu_edit_items[] = {
     ITEM("Undo", "undo"), ITEM("Redo", "redo"),
@@ -2901,7 +3452,10 @@ static const MenuItem menu_edit_items[] = {
     ASK("Copy range...", "copy", "Line/range> "),
     ASK("Cut range...", "cut", "Line/range> "),
     ASK("Delete range...", "dline", "Line/range> "),
-    ASK("Delete N...", "@count-dline", "Delete count> ")
+    ASK("Delete N...", "@count-dline", "Delete count> "),
+    ASK("Insert shell output...", "shell", "Shell> "),
+    ASK("Filter whole document...", "filter", "Filter command> "),
+    ASK("Filter numbered lines...", "filter-lines", "Range and command> ")
 };
 static const MenuItem menu_move_items[] = {
     ASK("Find text...", "find", "Find> "),
@@ -2920,21 +3474,34 @@ static const MenuItem menu_history_items[] = {
     ITEM("History counts", "history")
 };
 static const MenuItem menu_control_items[] = {
-    ITEM("Movement", "movement"), ITEM("Edit", "edit"),
-    SPECIAL("Mouse on/off", MENU_MOUSE_TOGGLE),
-    ITEM("Signal handling", "signals toggle"),
-    ITEM("Key bindings", "bindings"),
-    ASK("Bind key...", "bind", "Key command> "),
-    ASK("Unbind key...", "unbind", "Key name> "),
-    SPECIAL("Esc: CLI/menu", MENU_ESC_TOGGLE),
-    ITEM("Write to pipe", "write -"),
-    ITEM("Suspend", "suspend")
+    SPECIAL("Current editing", MENU_MOVEMENT),
+    ITEM("Write to pipe", "write -"), ITEM("Suspend", "suspend")
 };
 static const MenuItem menu_help_items[] = {
     ITEM("Getting started", "help"), ITEM("Commands by task", "list"),
     ASK("Find a command...", "list", "Task or word> "),
     ASK("Explain a command...", "help", "Command or topic> "),
-    ITEM("Manual", "manual"), ITEM("About", "about")
+    ITEM("Manual", "manual"), ITEM("About", "about"),
+    GROUP("Settings >", MENU_SETTINGS),
+    ITEM("User commands", "functions"),
+    ASK("Define command...", "define", "NAME command> "),
+    ASK("Remove command...", "undefine", "User name> "),
+    ASK("Run script...", "run", "Script file> ")
+};
+static const MenuItem menu_settings_items[] = {
+    ITEM("Start in", "toggle-startup"),
+    ITEM("Esc opens", "toggle-esc"),
+    ITEM("Mouse", "toggle-mouse"),
+    ITEM("Signal handling", "toggle-signals"),
+    ITEM("Clipboard history", "toggle-cliphistory"),
+    GROUP("User hotkeys >", MENU_KEYS),
+    ITEM("Settings explained", "help settings"),
+    ITEM("Current / saved settings", "settings show")
+};
+static const MenuItem menu_keys_items[] = {
+    ITEM("List assigned keys", "bindings"),
+    ASK("Assign a key...", "bind", "Key command> "),
+    ASK("Remove assignment...", "unbind", "Key name> ")
 };
 static const MenuItem menu_exit_items[] = {
     ITEM("Quit", "quit"), SPECIAL("Discard & quit", MENU_QUIT_FORCE)
@@ -2963,6 +3530,8 @@ static const MenuItem *menu_entries(size_t *count, const char **title)
     case MENU_HISTORY: entry = menu_history_items; *count = sizeof menu_history_items / sizeof *entry; *title="History"; break;
     case MENU_CONTROL: entry = menu_control_items; *count = sizeof menu_control_items / sizeof *entry; *title="Controls"; break;
     case MENU_HELP: entry = menu_help_items; *count = sizeof menu_help_items / sizeof *entry; *title="Help"; break;
+    case MENU_SETTINGS: entry = menu_settings_items; *count = sizeof menu_settings_items / sizeof *entry; *title="Settings"; break;
+    case MENU_KEYS: entry = menu_keys_items; *count = sizeof menu_keys_items / sizeof *entry; *title="User hotkeys"; break;
     case MENU_EXIT: entry = menu_exit_items; *count = sizeof menu_exit_items / sizeof *entry; *title="Exit"; break;
     default: entry = menu_root_items; *count = sizeof menu_root_items / sizeof *entry; *title="Menu"; break;
     }
@@ -2978,23 +3547,24 @@ static void menu_enter(int page)
     command[0] = 0; command_n = command_cursor = 0;
     history_choice = -1; group = false;
     menu_page = page;
+    if (page == MENU_SETTINGS) (void)startup_settings();
     menu_selection = menu_first = 0;
     menu_number = -1; menu_discard_pending = false;
     menu_open = true;
 }
 static void menu_back(void)
 {
-    menu_number = -1; menu_discard_pending = false;
-    if (menu_page == MENU_ROOT) menu_open = false;
-    else {
-        int previous_page=menu_page;
-        size_t i;
-        menu_enter(MENU_ROOT);
-        for (i=0; i<sizeof menu_root_items/sizeof menu_root_items[0]; i++)
-            if (menu_root_items[i].action==MENU_SUBPAGE &&
-                menu_root_items[i].child==previous_page) {
-                menu_selection=i; break;
-            }
+    int previous_page=menu_page, parent;
+    size_t i, count;
+    const char *title;
+    const MenuItem *entries;
+    menu_number=-1; menu_discard_pending=false;
+    if (menu_page==MENU_ROOT) { menu_open=false; return; }
+    parent=menu_page==MENU_KEYS ? MENU_SETTINGS : menu_page==MENU_SETTINGS ? MENU_HELP : MENU_ROOT;
+    menu_enter(parent);
+    entries=menu_entries(&count,&title);
+    for (i=0;i<count;i++) if (entries[i].action==MENU_SUBPAGE && entries[i].child==previous_page) {
+        menu_selection=i; break;
     }
 }
 static void draw_menu(Buffer *out, Buffer *line, int body)
@@ -3010,17 +3580,37 @@ static void draw_menu(Buffer *out, Buffer *line, int body)
     if (menu_discard_pending)
         snprintf(label,sizeof label,cols<27 ? "Enter again" : "Discard changes? Enter again to confirm");
     else if (cols < 27)
-        snprintf(label,sizeof label,"%s %zu/%zu",title,menu_selection+1,count);
+        snprintf(label,sizeof label,"%s %zu/%zu",cols<16 && menu_page==MENU_SETTINGS ? "Set" :
+                 cols<16 && menu_page==MENU_KEYS ? "Keys" : title,menu_selection+1,count);
     else
         snprintf(label,sizeof label,"%s %zu/%zu | j/k or arrows; h/Esc back", title,menu_selection+1,count);
     visible(line,label,strlen(label),0,(size_t)(cols - 1));
     draw_row(out,0,line,true);
     for (i=menu_first; i<count && i<menu_first+capacity && row<body; i++, row++) {
         const char *name=entries[i].label;
-        if (entries[i].command && !strcmp(entries[i].command, "signals toggle"))
-            name = cols < 27 ? (signal_controls ? "Sig ON" : "Sig OFF") :
-                   (signal_controls ? "Signal handling: ON" : "Signal handling: OFF");
-        snprintf(item,sizeof item,"%c%zu %s",i==menu_selection ? '>' : ' ',i+1,name);
+        if (entries[i].action==MENU_MOVEMENT)
+            name=cols<27 ? (movement_mode ? "Now Move" : "Now Edit") :
+                 (movement_mode ? "Current editing: Movement" : "Current editing: Edit");
+        else if (entries[i].command && !strcmp(entries[i].command, "toggle-startup"))
+            name = startup_config_error ? "Start: ?" : cols<27 ?
+                   (startup_movement ? "Start M" : "Start E") :
+                   (startup_movement ? "Start in: Movement" : "Start in: Edit");
+        else if (entries[i].command && !strcmp(entries[i].command, "toggle-esc"))
+            name = cols<27 ? (menu_preferred ? "Esc Menu" : "Esc CLI") :
+                   (menu_preferred ? "Esc opens: Menu" : "Esc opens: Command line");
+        else if (entries[i].command && !strcmp(entries[i].command, "toggle-mouse"))
+            name = cols<27 ? (mouse_enabled ? "Mouse On" : "Mouse Off") :
+                   (mouse_enabled ? "Mouse: On" : "Mouse: Off");
+        else if (entries[i].command && !strcmp(entries[i].command, "toggle-signals"))
+            name = cols<27 ? (signal_controls ? "Sig:On" : "Sig:Off") :
+                   (signal_controls ? "Signals: On (cancel)" : "Signals: Off (exit)");
+        else if (entries[i].command && !strcmp(entries[i].command, "toggle-cliphistory"))
+            name = cols<27 ? (clip_history_enabled ? "ClipH On" : "ClipH Off") :
+                   (clip_history_enabled ? "Clipboard history: On" : "Clipboard history: Off");
+        /* Reverse video already marks the selected row. On very narrow
+         * screens omit the extra marker so values such as Mouse Off fit. */
+        if (cols<16) snprintf(item,sizeof item,"%zu %s",i+1,name);
+        else snprintf(item,sizeof item,"%c%zu %s",i==menu_selection ? '>' : ' ',i+1,name);
         visible(line,item,strlen(item),0,(size_t)(cols - 1));
         draw_row(out,row,line,i==menu_selection);
     }
@@ -3074,7 +3664,9 @@ static void draw(void)
         else if (menu_number>=0) {
             snprintf(info,sizeof info,"Choice %d: Enter",menu_number);
             hint=info;
-        } else if (editing_clipboard) hint="Write saves | clipboard returns";
+        } else if (menu_page==MENU_SETTINGS && menu_selection<5)
+            hint=cols<27 ? "Enter: toggle & save" : "Enter toggles and saves | h/Esc back";
+        else if (editing_clipboard) hint="Write saves | clipboard returns";
         else hint=cols<27 ? "j/k l h" : "j/k move | l/Enter select | h/Esc back";
         visible(&line,hint,strlen(hint),0,width);
         draw_row(&out,body+1,&line,false);
@@ -3453,15 +4045,16 @@ static bool private_write(const char *path, const char *data, size_t n, bool no_
 {
     char *tmp = NULL, *dir = NULL, *slash;
     int fd = -1, dfd = -1;
-    bool ok = false;
-    tmp = malloc(strlen(path)+16);
+    bool ok = false, temporary_created = false;
+    tmp = join_strings(path, ".XXXXXX", "");
     if (!tmp) goto done;
-    snprintf(tmp,strlen(path)+16,"%s.XXXXXX",path);
     fd = mkstemp(tmp);
     if (fd < 0) goto done;
+    temporary_created = true;
     if (fchmod(fd,0600) < 0 || write_all(fd,data,n)<0 || sync_fd(fd)<0) goto done;
     if (close(fd)<0) { fd=-1; goto done; }
     fd=-1;
+    if (io_cancelled()) goto done;
     if (no_replace) {
         if (link(tmp,path)<0) goto done;
         (void)unlink(tmp);
@@ -3474,12 +4067,154 @@ static bool private_write(const char *path, const char *data, size_t n, bool no_
         if (dfd>=0) (void)sync_fd(dfd);
     }
 done:
-    if (dfd>=0) close(dfd);
-    if (fd>=0) close(fd);
-    if (!ok && tmp) (void)unlink(tmp);
+    { int error = errno;
+      if (dfd>=0) close(dfd);
+      if (fd>=0) close(fd);
+      if (!ok && temporary_created) (void)unlink(tmp);
+      errno = error;
+    }
     free(dir); free(tmp);
     return ok;
 }
+/* The definitions file is inert text, not an executable config language.
+ * A complete parse replaces the table; malformed files cannot partly load. */
+static bool load_user_commands(void)
+{
+    Buffer b={0};
+    UserCommand *fresh=NULL;
+    char *path=config_path("commands.conf",false), *line;
+    struct stat st;
+    size_t count=0;
+    int result, saved_error=0;
+    bool ok=false;
+    if (!path && errno==ENOENT) result=0;
+    else if (!path) {saved_error=errno;goto done;}
+    else {
+        result=read_config_file(path,&b,&st);
+        if (result<0) {saved_error=errno;goto done;}
+    }
+    fresh=calloc(USER_CMD_MAX,sizeof *fresh);
+    if (!fresh) {saved_error=ENOMEM;goto done;}
+    if (result==1) {
+        line=b.s;
+        while (line && *line) {
+            char *next=strchr(line,'\n'), *separator;
+            size_t n;
+            if (next) *next++=0;
+            n=strlen(line);
+            if (n && line[n-1]=='\r') line[--n]=0;
+            if (!*line || *line=='#') {line=next;continue;}
+            separator=strchr(line,'\t');
+            if (!separator || count==USER_CMD_MAX) {saved_error=EINVAL;goto done;}
+            *separator++=0;
+            n=strlen(separator);
+            if (!user_command_name(line) || !n || n>=USER_CMD_BODY) {
+                saved_error=EINVAL;goto done;
+            }
+            {
+                size_t i;
+                for(i=0;i<count;i++) if (!strcmp(fresh[i].name,line)) {
+                    saved_error=EINVAL;goto done;
+                }
+                for(i=0;i<n;i++) if ((unsigned char)separator[i]<32 && separator[i]!='\t') {
+                    saved_error=EINVAL;goto done;
+                }
+            }
+            memcpy(fresh[count].name,line,strlen(line)+1);
+            memcpy(fresh[count].body,separator,n+1);
+            count++;line=next;
+        }
+    }
+    memcpy(user_commands,fresh,count*sizeof *fresh);
+    user_command_count=count;
+    user_commands_version_valid=result==1;
+    if (result==1) user_commands_version=st;
+    user_commands_loaded=true;
+    ok=true;
+done:
+    free(path);free(b.s);free(fresh);
+    if (!ok) {errno=saved_error ? saved_error : EINVAL;user_commands_loaded=false;}
+    return ok;
+}
+/* Keep a stale editor from silently replacing another session's definitions. */
+static bool save_user_command_table(const UserCommand *items, size_t count)
+{
+    Buffer b={0};
+    char *path=NULL,*check=NULL;
+    struct stat st;
+    size_t i;
+    bool ok=false;
+    int error=0;
+    if (!user_commands_loaded || count>USER_CMD_MAX) {errno=EINVAL;return false;}
+    check=config_path("commands.conf",false);
+    if (!check && errno!=ENOENT) return false;
+    if (check) {
+        if (lstat(check,&st)==0) {
+            if (!user_commands_version_valid || !same_disk_version(&st,&user_commands_version)) {
+                error=EAGAIN;goto done;
+            }
+        } else if (errno!=ENOENT || user_commands_version_valid) {
+            error=errno==ENOENT ? EAGAIN : errno;goto done;
+        }
+    } else if (user_commands_version_valid) {error=EAGAIN;goto done;}
+    path=config_path("commands.conf",true);
+    if (!path) {error=errno;goto done;}
+    for(i=0;i<count;i++) {
+        size_t a=strlen(items[i].name), z=strlen(items[i].body);
+        if (a+z+2>CONFIG_LIMIT-b.n ||
+            !reserve(&b,b.n+a+z+3)) {error=EFBIG;goto done;}
+        memcpy(b.s+b.n,items[i].name,a);b.n+=a;b.s[b.n++]='\t';
+        memcpy(b.s+b.n,items[i].body,z);b.n+=z;b.s[b.n++]='\n';b.s[b.n]=0;
+    }
+    if (!private_write(path,b.s ? b.s : "",b.n,false)) {error=errno;goto done;}
+    if (lstat(path,&st)<0) {error=errno;goto done;}
+    /* The committed file is authoritative even if stat afterward fails. */
+    memcpy(user_commands,items,count*sizeof *items);
+    user_command_count=count;user_commands_version=st;user_commands_version_valid=true;
+    ok=true;
+done:
+    free(check);free(path);free(b.s);
+    if (!ok) errno=error ? error : EIO;
+    return ok;
+}
+static bool change_user_command(const char *name, const char *body)
+{
+    UserCommand *copy;
+    size_t count=user_command_count;
+    int index=user_command_index(name);
+    bool okay=false;
+    if (!user_command_name(name)) {tell("Names: a-z followed by a-z, 0-9, _ or -; no built-ins.");return false;}
+    if (body && (!*body || strlen(body)>=USER_CMD_BODY || strchr(body,'\n') || strchr(body,'\r'))) {
+        tell("Definition must be one command line (1-%d bytes).",USER_CMD_BODY-1);return false;
+    }
+    if (!body && index<0) {tell("No such user command: %s.",name);return false;}
+    if (body && index<0 && count==USER_CMD_MAX) {tell("Maximum %d user commands.",USER_CMD_MAX);return false;}
+    copy=calloc(USER_CMD_MAX,sizeof *copy);
+    if (!copy) {tell("No memory for command definitions.");return false;}
+    memcpy(copy,user_commands,count*sizeof *copy);
+    if (!body) {
+        memmove(copy+index,copy+index+1,(count-(size_t)index-1)*sizeof *copy);
+        count--;
+    } else {
+        size_t i;
+        if (index<0) index=(int)count++;
+        memcpy(copy[index].name,name,strlen(name)+1);
+        memcpy(copy[index].body,body,strlen(body)+1);
+        for(i=0;i<strlen(body);i++)
+            if ((unsigned char)body[i]<32 && body[i]!='\t') {
+                tell("Control bytes are not allowed in definitions.");goto done;
+            }
+    }
+    if (!save_user_command_table(copy,count)) {
+        tell("Command NOT saved: %s. Reload with functions reload if another editor changed it.",strerror(errno));
+    } else {
+        okay=true;
+        tell("%s user command %s. Saved in commands.conf.",body ? "Defined" : "Removed",name);
+    }
+done:
+    free(copy);return okay;
+}
+
 static bool clipboard_history_setting(bool on)
 {
     char *path=state_path("clipboard-history.enabled",true);
@@ -3497,6 +4232,51 @@ static void clipboard_history_load_setting(void)
     if (path && read_file(path,&b,&st) && b.n==3 && !memcmp(b.s,"on\n",3))
         clip_history_enabled=true;
     free(b.s); free(path);
+}
+/* All persistent switches share validation, save-before-apply, feedback and
+ * menu behavior. The clipboard flag retains its existing state-file format. */
+static void toggle_setting(int kind)
+{
+    bool enabled;
+    const SettingToggle *setting;
+    if (kind<0 || kind>=SETTING_COUNT) return;
+    setting=setting_toggles+kind;
+    enabled=!setting_enabled(kind);
+    startup_sync_warning=false;
+    if (!(kind==SETTING_CLIPHISTORY ? clipboard_history_setting(enabled) :
+          kind==SETTING_STARTUP ? save_startup_setting(-1) :
+          save_preference(kind,enabled))) {
+        int error=errno;
+        tell("%s setting NOT saved: %s. Behavior unchanged.",setting->label,strerror(error));
+        command_notice("Setting not saved");
+        return;
+    }
+    switch (kind) {
+    case SETTING_STARTUP:
+        tell("Startup saved: %s. Current mode unchanged.",startup_movement ? "movement" : "edit");
+        break;
+    case SETTING_ESC:
+        menu_preferred=startup_esc_menu;
+        tell("Esc opens: %s (saved). Movement/edit unchanged.",menu_preferred ? "Menu" : "Command line");
+        break;
+    case SETTING_MOUSE:
+        mouse_enabled=startup_mouse;
+        mouse_tracking(mouse_enabled);
+        tell("Mouse %s (saved).",mouse_enabled ? "ON" : "OFF");
+        break;
+    case SETTING_SIGNALS:
+        signal_controls=startup_signals;
+        tell("Signal handling %s (saved): interrupt %s; stop suspends.",
+             signal_controls ? "ON" : "OFF",signal_controls ? "cancels" : "exits without saving");
+        break;
+    case SETTING_CLIPHISTORY:
+        tell("Clipboard history %s (saved). Existing snapshots retained.",clip_history_enabled ? "ON" : "OFF");
+        break;
+    }
+    if (startup_sync_warning) {
+        tell("%s saved. Warning: directory sync failed; power-loss durability uncertain.",setting->label);
+        command_notice("Setting saved with durability warning");
+    }
 }
 /* A slot name is a literal, short ASCII identifier. No separators,
  * whitespace or dot names are accepted; the special default is not a slot. */
@@ -3529,12 +4309,14 @@ static char *clipboard_path(bool create)
  * a copy/move of any clipboard's contents. */
 static bool clipboard_choose(const char *slot)
 {
-    char *path=state_path("clipboard-selected.txt",true);
+    char *path;
     bool ok;
+    if (*slot && !clipboard_slot_valid(slot)) { errno=EINVAL; return false; }
+    path=state_path("clipboard-selected.txt",true);
     if (!path) return false;
     ok=private_write(path,slot,strlen(slot),false);
     free(path);
-    if (ok) strcpy(selected_clipboard,slot);
+    if (ok) memcpy(selected_clipboard,slot,strlen(slot)+1);
     return ok;
 }
 static void clipboard_load_selection(void)
@@ -3548,7 +4330,7 @@ static void clipboard_load_selection(void)
         if (b.n==0) selected_clipboard[0]=0;
         else if (b.s && !(memchr(b.s,0,b.n))) {
             b.s[b.n]=0;
-            if (clipboard_slot_valid(b.s)) strcpy(selected_clipboard,b.s);
+            if (clipboard_slot_valid(b.s)) memcpy(selected_clipboard,b.s,b.n+1);
         }
     }
     free(b.s); free(path);
@@ -3648,7 +4430,7 @@ static void clipboard_list(void)
     }
     if (scan<0) goto list_failed;
     if (truncated && used+24<sizeof clipboard_page)
-        strcpy(clipboard_page+used,"(listing truncated)\n");
+        memcpy(clipboard_page+used,"(listing truncated)\n",sizeof "(listing truncated)\n");
     if (!shown && used+25<sizeof clipboard_page) {
         memcpy(clipboard_page+used,"(no stored clipboards)\n",23);
         used+=23; clipboard_page[used]=0;
@@ -3715,7 +4497,8 @@ static size_t clip_history_entries(ClipEntry items[CLIP_HISTORY_MAX], bool prune
         if (i>=CLIP_HISTORY_MAX) continue;
         if (count<CLIP_HISTORY_MAX) count++;
         for (j=count-1;j>i;j--) items[j]=items[j-1];
-        strcpy(items[i].name,ent->d_name);
+        /* clip_history_entry has checked the exact 29-byte filename format. */
+        memcpy(items[i].name,ent->d_name,strlen(ent->d_name)+1);
     }
     if (result<0 || fstat(fd,&after)<0) goto failure;
     if (!same_disk_version(&before,&after)) {errno=EAGAIN;goto failure;}
@@ -3878,7 +4661,7 @@ static void clip_history_list(void)
         clipboard_page[used++]='\n';clipboard_page[used]=0;
     }
     if (!count && used+32<sizeof clipboard_page)
-        strcpy(clipboard_page+used,"(no saved clipboard entries)\n");
+        memcpy(clipboard_page+used,"(no saved clipboard entries)\n",sizeof "(no saved clipboard entries)\n");
     free(path);free(dir);
     open_viewer("Clipboard history",clipboard_page);
     return;
@@ -3898,9 +4681,8 @@ static void clip_history_use(size_t number)
     if (!number || number>count) { tell("Clip entry must be 1-%zu.",count);return; }
     dir=state_path("clipboard-history",false);
     if (!dir) { tell("Clipboard history directory unavailable.");return; }
-    path=malloc(strlen(dir)+strlen(entries[number-1].name)+2);
-    if (!path) { free(dir);tell("Out of memory.");return; }
-    sprintf(path,"%s/%s",dir,entries[number-1].name);
+    path=join_strings(dir,"/",entries[number-1].name);
+    if (!path) { free(dir);tell("Cannot allocate history path: %s.",strerror(errno));return; }
     if (!read_file(path,&b,&st))
         tell("Cannot read history entry: %s.",strerror(errno));
     else if (st.st_uid!=geteuid() || (st.st_mode & 077))
@@ -4244,9 +5026,8 @@ static void path_complete(void)
         if (fstatat(dirfd(d), first, &st, 0) < 0) goto fail;
         directory = S_ISDIR(st.st_mode);
         if (directory) {
-            full = malloc(strlen(dir) + strlen(first) + 2);
+            full = join_strings(dir, dir[strlen(dir) - 1] == '/' ? "" : "/", first);
             if (!full) goto fail;
-            sprintf(full, "%s%s%s", dir, dir[strlen(dir) - 1] == '/' ? "" : "/", first);
         }
     }
     result = closedir(d); d = NULL;
@@ -4296,7 +5077,7 @@ static void paste(void)
         (command_n >= COMMAND_SIZE || command_cursor > command_n || command[command_n] != 0) :
         (text.n > LIMIT || cursor > text.n);
     bool rejected = invalid, draining = paste_discard;
-    bool size_rejected = false;
+    bool size_rejected = false, after_cr = false;
     size_t limit = invalid ? 0 : command_mode ? COMMAND_SIZE - 1 - command_n : LIMIT - text.n;
     bool ignored = draining || prompt != PROMPT_NONE || viewer_text != NULL ||
         menu_open || reverse_mode || (movement_mode && !command_mode);
@@ -4349,14 +5130,37 @@ static void paste(void)
             if (matched > limit - b.n) rejected = size_rejected = true;
             else if (!reserve(&b, b.n + matched + 1)) rejected = true;
             else { memcpy(b.s + b.n, end, matched); b.n += matched; }
+            /* A failed end-marker prefix is literal data between CR and LF. */
+            after_cr = false;
         }
         matched = 0;
         if (c == 27) { matched = 1; continue; }
         if (!c && !ignored) rejected = true;
         if (!rejected && !ignored) {
-            if (b.n >= limit) rejected = size_rejected = true;
-            else if (!reserve(&b, b.n + 2)) rejected = true;
-            else { b.s[b.n++] = (char)c; b.s[b.n] = 0; }
+            char literal = (char)c;
+            const char *part = &literal;
+            size_t length = 1;
+            /* Terminal pastes can carry CR, LF, or CRLF line breaks. Treat
+             * them like Enter in this document, not literal ^M characters.
+             * Skip only the LF immediately after a CR, including across
+             * input-buffer boundaries. File reads, pipe input and clipboard
+             * commands remain byte-preserving. Command prompts keep their
+             * separate rule rejecting multiline paste without executing it.
+             * Normalize as we collect: no second document-sized allocation,
+             * and the size limit applies to bytes actually inserted. */
+            if (!command_mode) {
+                bool paired_lf = c == '\n' && after_cr;
+                after_cr = c == '\r';
+                if (paired_lf) continue;
+                if (c == '\r' || c == '\n') {
+                    part = newline; length = newline_n;
+                }
+            }
+            if (length > limit - b.n) rejected = size_rejected = true;
+            else if (!reserve(&b, b.n + length + 1)) rejected = true;
+            else {
+                memcpy(b.s + b.n, part, length); b.n += length; b.s[b.n] = 0;
+            }
         }
     }
     free(b.s);
@@ -4457,7 +5261,7 @@ static void complete_command(void)
                             memcpy(alias,begin,n); alias[n]=0;
                             /* Save the candidate only if this is the sole
                              * matching canonical operation so far. */
-                            if (matches==0) strcpy(replacement,alias);
+                            if (matches==0) memcpy(replacement,alias,n+1);
                             found=true;
                         }
                     }
@@ -4472,6 +5276,11 @@ static void complete_command(void)
             matches++;
             guide_append(&used,"  %s\n    %s\n",command_info[i].name,command_info[i].summary);
         }
+    }
+    for (i=0;i<user_command_count;i++) if (!strncasecmp(user_commands[i].name,command+start,typed)) {
+        if (!matches) memcpy(replacement,user_commands[i].name,strlen(user_commands[i].name)+1);
+        matches++;
+        guide_append(&used,"  %s\n    %s\n",user_commands[i].name,user_commands[i].body);
     }
     if (matches==1) {
         size_t len=strlen(replacement);
@@ -4616,6 +5425,352 @@ static bool blank_tail(const char *s)
 static void vertical(int direction, int count);
 static bool history_suppress;
 
+/* Deliberate external command invocation. Nothing opened or pasted is executed.
+ * The child has no terminal stdin and stdout/stderr never reach our screen.
+ * A private temporary input file avoids pipe deadlock for large filter input;
+ * the two output pipes are drained concurrently with bounded buffers. */
+static bool process_append(Buffer *b, const unsigned char *src, size_t n,
+                           size_t maximum, bool *pending_cr)
+{
+    size_t i;
+    for (i=0;i<n;i++) {
+        unsigned char c=src[i];
+        if (*pending_cr) {
+            /* CRLF counts as one newline, even between separate reads. */
+            *pending_cr=false;
+            if (newline_n > maximum-b->n) {errno=EFBIG;return false;}
+            if (!reserve(b,b->n+newline_n+1)) return false;
+            memcpy(b->s+b->n,newline,newline_n); b->n+=newline_n;
+            if (c=='\n') continue;
+        }
+        if (c==0 || c==27 || (c<32 && c!='\n' && c!='\t' && c!='\r') || c==127) {
+            errno=EILSEQ; return false;
+        }
+        if (c=='\r') { *pending_cr=true; continue; }
+        if (c=='\n') {
+            if (newline_n > maximum-b->n) {errno=EFBIG;return false;}
+            if (!reserve(b,b->n+newline_n+1)) return false;
+            memcpy(b->s+b->n,newline,newline_n); b->n+=newline_n;
+        } else {
+            if (b->n>=maximum) {errno=EFBIG;return false;}
+            if (!reserve(b,b->n+2)) return false;
+            b->s[b->n++]=(char)c;
+        }
+    }
+    if (b->s) b->s[b->n]=0;
+    return true;
+}
+static bool process_flush_cr(Buffer *b, size_t maximum, bool pending_cr)
+{
+    if (!pending_cr) return true;
+    if (newline_n > maximum-b->n) {errno=EFBIG;return false;}
+    if (!reserve(b,b->n+newline_n+1)) return false;
+    memcpy(b->s+b->n,newline,newline_n);b->n+=newline_n;b->s[b->n]=0;
+    return true;
+}
+static bool process_capture(const char *cmd, const char *input_bytes, size_t input_n,
+                            size_t maximum, Buffer *output, char *report, size_t report_n)
+{
+    FILE *input_file=NULL;
+    int out[2]={-1,-1}, err[2]={-1,-1}, status=0, error=0;
+    int io[2], i;
+    pid_t pid=-1, waited=-1;
+    bool cr=false, good=true;
+    size_t stderr_used=0;
+    char stderr_text[256]={0};
+    if (!cmd || !*cmd) { snprintf(report,report_n,"Shell command required."); return false; }
+    if (input_bytes) {
+        input_file=tmpfile();
+        if (!input_file || (input_n && fwrite(input_bytes,1,input_n,input_file)!=input_n) ||
+            fflush(input_file)!=0 || fseek(input_file,0,SEEK_SET)!=0) {
+            snprintf(report,report_n,"Cannot prepare filter input: %s.",strerror(errno));
+            if (input_file) fclose(input_file);
+            return false;
+        }
+    }
+    if (pipe(out)<0 || pipe(err)<0) {
+        good=false;error=errno;snprintf(report,report_n,"Cannot create process pipes: %s.",strerror(error));
+        goto failed;
+    }
+    pid=fork();
+    if (pid<0) {
+        good=false;error=errno;snprintf(report,report_n,"Cannot fork: %s.",strerror(error));
+        goto failed;
+    }
+    if (pid==0) {
+        int source=-1;
+        /* Independent group so cancellation also stops a shell pipeline. */
+        (void)setpgid(0,0);
+        if (input_file) source=fileno(input_file);
+        else source=open("/dev/null",O_RDONLY);
+        if (source<0 || dup2(source,STDIN_FILENO)<0 ||
+            dup2(out[1],STDOUT_FILENO)<0 || dup2(err[1],STDERR_FILENO)<0) _exit(127);
+        if (source>STDERR_FILENO) close(source);
+        close(out[0]);close(out[1]);close(err[0]);close(err[1]);
+        if (tty_extra>=0) close(tty_extra);
+        /* The child gets default signals; our editor handlers are not inherited. */
+        signal(SIGINT,SIG_DFL);signal(SIGTERM,SIG_DFL);
+        signal(SIGQUIT,SIG_DFL);signal(SIGPIPE,SIG_DFL);
+        execl("/bin/sh","sh","-c",cmd,(char *)NULL);
+        _exit(127);
+    }
+    (void)setpgid(pid,pid); /* Child may already have exec'd. */
+    close(out[1]);out[1]=-1;close(err[1]);err[1]=-1;
+    io[0]=out[0];io[1]=err[0];
+    for(i=0;i<2;i++) {
+        int flags=fcntl(io[i],F_GETFL);
+        if (flags<0 || fcntl(io[i],F_SETFL,flags|O_NONBLOCK)<0) {
+            good=false; error=errno;break;
+        }
+    }
+    while (good && (io[0]>=0 || io[1]>=0)) {
+        struct pollfd fds[2]; nfds_t count=0;
+        if (io_cancelled()) {good=false;error=EINTR;break;}
+        for(i=0;i<2;i++) if (io[i]>=0) {
+            fds[count].fd=io[i];fds[count].events=POLLIN|POLLHUP|POLLERR;fds[count].revents=0;count++;
+        }
+        if (poll(fds,count,100)<0) {
+            if (errno==EINTR) continue;
+            good=false;error=errno;break;
+        }
+        for(i=0;i<2 && good;i++) {
+            unsigned char chunk[4096]; ssize_t n;
+            if (io[i]<0) continue;
+            for (;;) {
+                n=read(io[i],chunk,sizeof chunk);
+                if (n<0 && errno==EINTR) continue;
+                if (n<0 && (errno==EAGAIN || errno==EWOULDBLOCK)) break;
+                if (n<0) {good=false;error=errno;break;}
+                if (n==0) {close(io[i]);io[i]=-1;break;}
+                if (i==0) {
+                    if (!process_append(output,chunk,(size_t)n,maximum,&cr)) {
+                        error=errno ? errno : EFBIG;
+                        if (output->n>=maximum || error==ENOMEM) error=EFBIG;
+                        good=false;break;
+                    }
+                } else {
+                    size_t j;
+                    for(j=0;j<(size_t)n && stderr_used<sizeof stderr_text-1;j++) {
+                        unsigned char c=chunk[j];
+                        stderr_text[stderr_used++]=(char)((c>=32 && c<127) ? c : (c=='\n' ? ' ' : '?'));
+                    }
+                    stderr_text[stderr_used]=0;
+                }
+            }
+        }
+    }
+    if (good && !process_flush_cr(output,maximum,cr)) {
+        good=false;error=errno ? errno : EFBIG;
+    }
+    if (!good) {
+        /* Cancel the entire pipeline before waiting. Do not leave children
+         * using pipes after the editor has returned to its command prompt. */
+        (void)kill(-pid,SIGKILL);(void)kill(pid,SIGKILL);
+    }
+    for (i=0;i<2;i++) if (io[i]>=0) close(io[i]);
+    while ((waited=waitpid(pid,&status,0))<0 && errno==EINTR) {}
+    if (waited!=pid) {good=false;error=errno;}
+    if (!good) {
+        snprintf(report,report_n,"Command stopped; output discarded (%s).",
+                 error==EINTR ? "interrupted" : error==EILSEQ ? "non-text control byte" :
+                 error==EFBIG ? "size limit" : strerror(error ? error : EIO));
+    } else if (!WIFEXITED(status) || WEXITSTATUS(status)!=0) {
+        int code=WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        snprintf(report,report_n,"Shell failed (status %d): %.150s",code,
+                 stderr_used ? stderr_text : "no diagnostic");
+        good=false;
+    } else if (stderr_used) {
+        snprintf(report,report_n,"stderr: %.150s",stderr_text);
+    } else report[0]=0;
+failed:
+    if (out[0]>=0 && pid<0) close(out[0]);
+    if (out[1]>=0) close(out[1]);
+    if (err[0]>=0 && pid<0) close(err[0]);
+    if (err[1]>=0) close(err[1]);
+    if (input_file) fclose(input_file);
+    return good && waited==pid && WIFEXITED(status) && WEXITSTATUS(status)==0;
+}
+static bool insert_shell_output(const char *command_line, size_t start, size_t length,
+                                bool replacing)
+{
+    Buffer output={0};
+    char report[256];
+    bool okay;
+    size_t maximum;
+    if (!*command_line) {tell("Shell command required.");return false;}
+    if (start>text.n || length>text.n-start) {tell("Invalid text range.");return false;}
+    maximum=LIMIT-(text.n-length);
+    okay=process_capture(command_line,replacing ? text.s+start : NULL,
+                         replacing ? length : 0,maximum,&output,report,sizeof report);
+    if (okay) {
+        if (!replacing && !output.n) tell("Command succeeded with no output. Text unchanged.%s%s",
+                                        *report ? " " : "",report);
+        else if (output.n==length && replacing &&
+                 (!length || !memcmp(output.s,text.s+start,length)))
+            tell("Filter output unchanged.%s%s",*report ? " " : "",report);
+        else if (!edit(start,length,output.s,output.n,false)) okay=false;
+        else tell("%s %zu bytes as one undo step.%s%s",
+                  replacing ? "Filtered" : "Inserted",output.n,
+                  *report ? " " : "",report);
+    } else {
+        if (interrupted) external_cancel_notice=true;
+        tell("%s",report);
+    }
+    free(output.s);
+    return okay;
+}
+
+/* Execute a deliberately small noninteractive editor instruction language.
+ * A script cannot open a prompt, change files, quit, or execute arbitrary
+ * document text. It may invoke shell explicitly and call user definitions.
+ * Steps are separate undo transactions; failure stops later instructions. */
+static bool execute_script_step(const char *line);
+static bool run_script_file(const char *name);
+static bool call_user_command(const char *name)
+{
+    int index=user_command_index(name);
+    char body[USER_CMD_BODY];
+    bool ok;
+    if (index<0) {tell("No user command named %s.",name);return false;}
+    if (script_depth==0) script_steps=0;
+    if (script_depth>=SCRIPT_DEPTH_MAX) {
+        tell("User command recursion limit (%d).",SCRIPT_DEPTH_MAX);return false;
+    }
+    memcpy(body,user_commands[index].body,strlen(user_commands[index].body)+1);
+    script_depth++;
+    ok=execute_script_step(body);
+    script_depth--;
+    return ok;
+}
+static bool run_script_file(const char *name)
+{
+    Buffer b={0};
+    char *path=NULL, *line;
+    bool ok=false;
+    int result;
+    size_t line_number=0;
+    if (!*name) {tell("Use run FILE to execute a plaintext command script.");return false;}
+    if (script_depth==0) script_steps=0;
+    if (script_depth>=SCRIPT_DEPTH_MAX) {
+        tell("Script recursion limit (%d).",SCRIPT_DEPTH_MAX);return false;
+    }
+    path=expand_home_path(name);
+    if (!path) {tell("Cannot expand script path.");return false;}
+    result=read_config_file(path,&b,NULL);
+    if (result!=1) {
+        tell("Cannot read trusted script %s: %s.",name,
+             result==0 ? "not found" : strerror(errno));goto done;
+    }
+    script_depth++;
+    line=b.s;
+    ok=true;
+    while (line && *line) {
+        char *next=strchr(line,'\n'), *cmd=line, *end;
+        if (next) *next++=0;
+        line_number++;
+        end=cmd+strlen(cmd);
+        if (end>cmd && end[-1]=='\r') *--end=0;
+        while (*cmd==' ' || *cmd=='\t') cmd++;
+        while (end>cmd && (end[-1]==' ' || end[-1]=='\t')) *--end=0;
+        if (*cmd && *cmd!='#') {
+            if (strlen(cmd)>=COMMAND_SIZE) {tell("Script line %zu too long.",line_number);ok=false;break;}
+            if (!execute_script_step(cmd)) {ok=false;break;}
+        }
+        if (io_cancelled()) {ok=false;tell("Script interrupted at line %zu.",line_number);break;}
+        line=next;
+    }
+    script_depth--;
+    if (ok) tell("Ran %zu script lines. Each edit has its own undo step.",line_number);
+    else {
+        char reason[sizeof message];
+        memcpy(reason,message,sizeof reason);
+        tell("Script line %zu stopped: %.170s",line_number,reason);
+    }
+done:
+    free(b.s);free(path);return ok;
+}
+/* A line-range filter is explicit; plain filter works on the entire file. */
+static bool filter_range_command(const char *arguments)
+{
+    const char *rest;
+    size_t first,last,from,end,total=line_count();
+    while (*arguments==' ' || *arguments=='\t') arguments++;
+    if (!positive_number(arguments,&rest,&first)) goto usage;
+    if (*rest=='-') {
+        if (!positive_number(rest+1,&rest,&last)) goto usage;
+    } else last=first;
+    if (*rest!=' ' && *rest!='\t') goto usage;
+    while (*rest==' ' || *rest=='\t') rest++;
+    if (!*rest || !first || last<first || last>total) goto usage;
+    from=numbered_line(first);
+    end=last==total ? text.n : numbered_line(last+1);
+    if (from==SIZE_MAX || end==SIZE_MAX || from>end) goto usage;
+    return insert_shell_output(rest,from,end-from,true);
+usage:
+    tell("Use filter-lines FIRST[-LAST] SHELL_COMMAND (line numbers 1-%zu).",total);
+    return false;
+}
+static bool execute_script_step(const char *source)
+{
+    char copy[COMMAND_SIZE], *verb=copy, *arg;
+    const CommandHelp *info;
+    size_t line, col, p, count;
+    const char *rest;
+    if (++script_steps>SCRIPT_STEP_MAX || io_cancelled()) {
+        tell("Script stopped: step limit or signal.");return false;
+    }
+    if (strlen(source)>=sizeof copy) {tell("Script command exceeds input limit.");return false;}
+    memcpy(copy,source,strlen(source)+1);
+    while (*verb==' ' || *verb=='\t') verb++;
+    arg=verb+strcspn(verb," \t");
+    if (*arg) { *arg++=0;while (*arg==' ' || *arg=='\t') arg++; }
+    if (!*verb) return true;
+    info=command_lookup(verb);
+    if (!info && user_command_index(verb)>=0) {
+        if (*arg) {tell("User command %s takes no arguments.",verb);return false;}
+        return call_user_command(verb);
+    }
+    if (!info) {tell("Unknown script command: %s.",verb);return false;}
+    verb=copy; /* command_lookup returned canonical name, not the local token */
+    verb=(char *)info->name;
+    if (!strcmp(verb,"shell")) return insert_shell_output(arg,cursor,0,false);
+    if (!strcmp(verb,"filter")) return insert_shell_output(arg,0,text.n,true);
+    if (!strcmp(verb,"filter-lines")) return filter_range_command(arg);
+    if (!strcmp(verb,"run")) return run_script_file(arg);
+    if (!strcmp(verb,"find")) {
+        if (!*arg) {tell("Script find requires text.");return false;}
+        start_search(arg);return !io_cancelled();
+    }
+    if (!strcmp(verb,"next") || !strcmp(verb,"prev"))
+        return !*arg && find_match(!strcmp(verb,"next"),false);
+    if (!strcmp(verb,"goto")) {
+        if (!positive_number(arg,&rest,&line) || (p=numbered_line(line))==SIZE_MAX)
+            goto usage;
+        col=1;
+        if (!blank_tail(rest) && (!positive_number(rest,&rest,&col) || !blank_tail(rest)))
+            goto usage;
+        cursor=position_at(p,col-1);goal_set=false;return true;
+    }
+    if (!strcmp(verb,"top") || !strcmp(verb,"bottom")) {
+        if (!blank_tail(arg)) goto usage;
+        cursor=!strcmp(verb,"top") ? 0 : text.n;goal_set=false;return true;
+    }
+    if (!strcmp(verb,"undo") || !strcmp(verb,"redo")) {
+        count=1;
+        if (*arg && (!positive_number(arg,&rest,&count) || !blank_tail(rest))) goto usage;
+        return history_move(!strcmp(verb,"redo"),count,false)>0;
+    }
+    if (!strcmp(verb,"movement") || !strcmp(verb,"edit")) {
+        if (!blank_tail(arg)) goto usage;
+        movement_mode=!strcmp(verb,"movement");goal_set=false;return true;
+    }
+    tell("Not permitted in scripts: %s. Use shell/filter/find/goto/top/bottom/"
+         "undo/redo/movement/edit/run or a user command.",verb);
+    return false;
+usage:
+    tell("Invalid script arguments for %s.",verb);return false;
+}
+
 static void execute(void);
 static void menu_run(void)
 {
@@ -4643,23 +5798,20 @@ static void menu_run(void)
         command_mode=true; command_set(""); history_choice=-1;
         return;
     }
-    if (chosen->action == MENU_MOUSE_TOGGLE) {
-        mouse_enabled=!mouse_enabled; mouse_tracking(mouse_enabled);
-        tell("Mouse %s.",mouse_enabled ? "enabled" : "disabled"); return;
-    }
-    if (chosen->action == MENU_ESC_TOGGLE) {
-        menu_preferred=!menu_preferred;
-        tell("Esc now opens %s.",menu_preferred ? "the menu" : "Command>"); return;
-    }
     if (chosen->action == MENU_QUIT_FORCE) {
         running=false;
         return;
     }
-    cmd=chosen->command;
+    cmd=chosen->action==MENU_MOVEMENT ? (movement_mode ? "edit" : "movement") : chosen->command;
     if (!cmd) return;
     if (!strcmp(cmd,"@cli-prompt")) { command_mode=true; command_set(""); return; }
     command_set(cmd);
     history_suppress=true; execute(); history_suppress=false;
+    /* Success shows the new value in place. Errors/warnings retain their
+     * viewer rather than disappearing behind the menu. */
+    if (!viewer_text && !command_mode &&
+        ((menu_page==MENU_SETTINGS && setting_toggle_index(cmd)>=0) ||
+         chosen->action==MENU_MOVEMENT)) menu_open=true;
 }
 static void menu_key(int c)
 {
@@ -4742,8 +5894,58 @@ static void execute(void)
         }
     }
     info = command_lookup(verb);
-    if (!info) { command_unknown(verb); return; }
+    if (!info) {
+        if (user_command_index(verb)>=0) {
+            if (*arg) tell("User command %s takes no arguments.",verb);
+            else (void)call_user_command(verb);
+        } else command_unknown(verb);
+        return;
+    }
     canonical = info->name;
+    if (!strcmp(canonical,"shell")) {
+        if (!*arg) request_argument("shell","Shell> ");
+        else (void)insert_shell_output(arg,cursor,0,false);
+        return;
+    }
+    if (!strcmp(canonical,"filter")) {
+        if (!*arg) request_argument("filter","Filter command> ");
+        else (void)insert_shell_output(arg,0,text.n,true);
+        return;
+    }
+    if (!strcmp(canonical,"filter-lines")) {
+        if (!*arg) request_argument("filter-lines","Lines and command> ");
+        else (void)filter_range_command(arg);
+        return;
+    }
+    if (!strcmp(canonical,"functions")) {
+        if (!*arg) show_user_commands(false);
+        else if (!strcmp(arg,"reload")) {
+            if (load_user_commands()) tell("Reloaded %zu user commands.",user_command_count);
+            else tell("Reload failed: %s. Definitions unchanged.",strerror(errno));
+        } else command_usage(info,"Use functions or functions reload.");
+        return;
+    }
+    if (!strcmp(canonical,"define")) {
+        char *name=arg, *body=name+strcspn(name," \t");
+        if (*body) {*body++=0;while (*body==' ' || *body=='\t') body++;}
+        if (!*name || !*body) {
+            if (!*arg) request_argument("define","NAME command> ");
+            else command_usage(info,"Use define NAME COMMAND; e.g. define files shell ls -1.");
+        } else (void)change_user_command(name,body);
+        return;
+    }
+    if (!strcmp(canonical,"undefine")) {
+        if (!*arg) request_argument("undefine","User name> ");
+        else if (!blank_tail(arg+strcspn(arg," \t")))
+            command_usage(info,"Use undefine NAME, no extra arguments.");
+        else (void)change_user_command(arg,NULL);
+        return;
+    }
+    if (!strcmp(canonical,"run")) {
+        if (!*arg) request_argument("run","Script file> ");
+        else (void)run_script_file(arg);
+        return;
+    }
     if (!strcmp(canonical,"find")) {
         if (!*arg) request_argument("find","Find> ");
         else start_search(arg);
@@ -4834,13 +6036,11 @@ static void execute(void)
         return;
     }
     if (!strcmp(canonical,"cliphistory")) {
-        if (!*arg) clip_history_list();
-        else if (!strcmp(arg,"on") || !strcmp(arg,"off")) {
-            if (clipboard_history_setting(!strcmp(arg,"on")))
-                tell("Clipboard history %s.",clip_history_enabled ? "enabled" : "disabled");
-            else tell("Unable to save clipboard history setting.");
-        } else tell("Use cliphistory [on|off].");
-        return;
+        if (!blank_tail(arg)) {
+            command_usage(info,"cliphistory only browses snapshots. Use toggle-cliphistory to switch collection.");
+            return;
+        }
+        clip_history_list(); return;
     }
     if (!strcmp(canonical,"clipuse")) {
         if (editing_clipboard) {
@@ -5035,6 +6235,22 @@ static void execute(void)
         }
         return;
     }
+    {
+        int kind=setting_toggle_index(canonical);
+        if (kind>=0) {
+            if (!blank_tail(arg)) {
+                command_usage(info,"%s takes no arguments; it switches and saves one setting.",canonical);
+                return;
+            }
+            toggle_setting(kind); return;
+        }
+    }
+    if (!strcmp(canonical,"settings")) {
+        if (blank_tail(arg)) menu_enter(MENU_SETTINGS);
+        else if (!strcmp(arg,"show")) show_settings();
+        else command_usage(info,"Use settings for the menu, or settings show to inspect saved/current values.");
+        return;
+    }
     if (!strcmp(canonical, "movement") || !strcmp(canonical, "edit")) {
         if (!blank_tail(arg)) { command_usage(info,"Type just %s, without an argument.",canonical); return; }
         movement_mode = !strcmp(canonical, "movement");
@@ -5056,8 +6272,7 @@ static void execute(void)
             tell("Deleted %zu byte%s (%s).",length,length==1?"":"s",canonical);
         return;
     }
-    if (*arg && strcmp(canonical, "mouse") && strcmp(canonical, "signals") &&
-        strcmp(canonical, "bind") && strcmp(canonical, "unbind")) {
+    if (*arg && strcmp(canonical, "bind") && strcmp(canonical, "unbind")) {
         command_usage(info,"%s takes no argument. Type just %s.",canonical,canonical); return;
     }
     else if (!strcmp(canonical, "history"))
@@ -5067,26 +6282,7 @@ static void execute(void)
     else if (!strcmp(canonical, "bottom")) { cursor=text.n; goal_set=false; }
     else if (!strcmp(canonical, "pageup") || !strcmp(canonical, "pagedown"))
         vertical(!strcmp(canonical,"pageup") ? -1 : 1, rows>3 ? rows-3 : 1);
-    else if (!strcmp(canonical, "menu")) {
-        menu_preferred=true; menu_enter(MENU_ROOT);
-    } else if (!strcmp(canonical, "cli")) {
-        menu_preferred=false; tell("Esc now opens Command>.");
-    } else if (!strcmp(canonical, "mouse")) {
-        if (!*arg || !strcmp(arg,"toggle")) mouse_enabled=!mouse_enabled;
-        else if (!strcmp(arg,"on")) mouse_enabled=true;
-        else if (!strcmp(arg,"off")) mouse_enabled=false;
-        else { tell("Use mouse on, mouse off, or mouse toggle."); return; }
-        mouse_tracking(mouse_enabled);
-        tell("Mouse %s.",mouse_enabled ? "enabled" : "disabled");
-    } else if (!strcmp(canonical, "signals")) {
-        if (!strcmp(arg, "toggle")) signal_controls = !signal_controls;
-        else if (!strcmp(arg, "on")) signal_controls = 1;
-        else if (!strcmp(arg, "off")) signal_controls = 0;
-        else if (*arg) { tell("Use signals on, signals off, or signals toggle."); return; }
-        tell("Signal handling %s: interrupt %s; stop suspends. Config: signal_controls=%s.",
-             signal_controls ? "ON" : "OFF", signal_controls ? "cancels" : "exits",
-             signal_controls ? "on" : "off");
-    } else if (!strcmp(canonical, "bindings")) show_bindings();
+    else if (!strcmp(canonical, "bindings")) show_bindings();
     else if (!strcmp(canonical, "bind")) {
         char keyname[48]; size_t n=strcspn(arg," \t");
         const char *action=arg+n;
@@ -5114,7 +6310,7 @@ static void execute(void)
     }
     else if (!strcmp(canonical, "suspend")) suspended=1;
     else if (!strcmp(canonical, "about")) open_viewer("About",about_text);
-    else if (!strcmp(canonical, "manual")) open_viewer("Manual",manual_text);
+    else if (!strcmp(canonical, "manual")) open_viewer("Manual",manual_full());
     else if (!strcmp(canonical, "quit!")) {
         running=false;
     } else if (!strcmp(canonical, "quit")) {
@@ -5448,7 +6644,7 @@ static void mouse_key(void)
 static void usage(void)
 {
     puts("editor " VERSION " - one-file, dependency-light terminal text editor\n"
-         "Usage: editor [--menu] [--mouse] [--movement|--edit] [--no-keys] [FILE|-]\n"
+         "Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [FILE|-]\n"
          "       editor --help | --manual | --about | --version\n\n"
          "FILE: edit named file.  - or piped stdin: edit text from a pipe.\n"
          "Interactive UI uses the controlling terminal when stdin/stdout are pipes.\n"
@@ -5457,8 +6653,10 @@ static void usage(void)
          "Esc: command prompt, or optional arrow/number/hjkl menu (--menu).\n"
          "--movement / --edit: override the startup setting for this launch.\n"
          "Config: ~/.config/editor/config or $XDG_CONFIG_HOME/editor/config.\n"
-         "Set startup=movement or startup=edit (default); -- ends option parsing.\n"
-         "signal_controls=off (default): native interrupt/stop; on: interrupt cancels.\n"
+         "toggle-startup saves the opposite startup choice; -- ends option parsing.\n"
+         "toggle-esc switches and saves Esc behavior; settings opens preferences.\n"
+         "toggle-signals saves signal handling: OFF exits, ON cancels.\n"
+         "toggle-mouse and toggle-cliphistory switch and save those settings.\n"
          "Ctrl-C/Z are not bound. Unsaved text is lost on a default interrupt exit.\n"
          "Click status bar to open menu if mouse enabled (--mouse).\n"
          "No default hotkeys. User bindings via 'bind' and 'unbind'.\n\n"
@@ -5476,7 +6674,7 @@ int main(int argc, char **argv)
     if (argc==2 && (!strcmp(argv[1],"--help") || !strcmp(argv[1],"-h"))) { usage(); return 0; }
     if (argc==2 && !strcmp(argv[1],"--version")) { puts("editor " VERSION); return 0; }
     if (argc==2 && !strcmp(argv[1],"--about")) { puts(about_text); return 0; }
-    if (argc==2 && !strcmp(argv[1],"--manual")) { puts(manual_text); return 0; }
+    if (argc==2 && !strcmp(argv[1],"--manual")) { puts(manual_full()); return 0; }
     load_startup_config();
     {
         int i, file_arg=0;
@@ -5488,12 +6686,14 @@ int main(int argc, char **argv)
                 file_arg=i; continue;
             }
             if (!strcmp(argv[i],"--menu")) menu_preferred=true;
+            else if (!strcmp(argv[i],"--cli")) menu_preferred=false;
             else if (!strcmp(argv[i],"--mouse")) mouse_enabled=true;
+            else if (!strcmp(argv[i],"--no-mouse")) mouse_enabled=false;
             else if (!strcmp(argv[i],"--movement") || !strcmp(argv[i],"--move")) movement_mode=true;
             else if (!strcmp(argv[i],"--edit")) movement_mode=false;
             else if (!strcmp(argv[i],"--no-keys")) keys_disabled=true;
             else if (!file_arg && (!strcmp(argv[i],"-") || argv[i][0]!='-')) file_arg=i;
-            else { fputs("Usage: editor [--menu] [--mouse] [--movement|--edit] [--no-keys] [FILE|-]\n",stderr); return 2; }
+            else { fputs("Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [FILE|-]\n",stderr); return 2; }
         }
         if (file_arg && !strcmp(argv[file_arg],"-")) from_stdin=true;
         else if (file_arg) filename=resolve_path(argv[file_arg]);
@@ -5535,6 +6735,9 @@ int main(int argc, char **argv)
         break;
     }
     if (tcgetattr(tty_in, &initial_termios) < 0) die(strerror(errno));
+    /* Definitions precede keymap validation so user-assigned keys may run a
+     * user-defined command. No command is executed while either file loads. */
+    (void)load_user_commands();
     load_bindings();
     clipboard_history_load_setting();
     clipboard_load_selection();
@@ -5552,7 +6755,9 @@ int main(int argc, char **argv)
     terminal_start();
     if (journal_ignored) tell("Undo journal unusable; prior journal retained, no history loaded.");
     else if (journal_rebased) tell("External changes added as one undo; write to persist history.");
-    else if (startup_config_warning) tell("Config entry ignored; see manual (startup or signal_controls).");
+    else if (startup_config_error) tell("Config not loaded: %s. Type settings show for path and settings.",strerror(startup_config_error));
+    else if (!user_commands_loaded) tell("User commands unavailable: commands.conf invalid or unreadable.");
+    else if (startup_config_warning) tell("Invalid config entry ignored. Type settings show for values/path.");
     else tell("editor " VERSION " | list | help | manual | about");
     while (running && !terminated) {
         if (suspended) {
@@ -5583,7 +6788,13 @@ int main(int argc, char **argv)
             reverse_mode = false;
             menu_open = false; menu_discard_pending = false; menu_argument_mode=false;
             command_mode = true; command_set(""); history_choice = -1;
-            group = false; tell("Use write, quit, or quit!."); dirty_screen = true;
+            group = false;
+            if (external_cancel_notice) {
+                tell("Command stopped; output discarded. Text unchanged.");
+                command_notice("External command cancelled");
+                external_cancel_notice=false;
+            } else tell("Use write, quit, or quit!.");
+            dirty_screen = true;
         }
         if (terminated || suspended || interrupted) continue;
         if (!terminal_active) {
