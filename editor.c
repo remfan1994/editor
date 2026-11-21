@@ -1,5 +1,5 @@
 /*
- * editor 0.6.13 - a small, single-file terminal text editor.
+ * editor 0.6.14 - a small, single-file terminal text editor.
  * Build: cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor
  * Run:   ./editor [FILE]
  *
@@ -64,7 +64,7 @@
 #define LIMIT ((size_t)8 * 1024 * 1024)
 #define COMMAND_SIZE 4096
 #define CONFIG_LIMIT ((size_t)32768)
-#define VERSION "0.6.13"
+#define VERSION "0.6.14"
 #define COMMAND_HISTORY_MAX 32
 #define JOURNAL_LIMIT ((size_t)128 * 1024 * 1024)
 #define JOURNAL_CHANGE_LIMIT 100000
@@ -98,7 +98,7 @@ static const char exit_notice[] =
 
 static const char manual_text[] =
     "EDITOR MANUAL\n"
-    "editor 0.6.13\n"
+    "editor 0.6.14\n"
     "\n"
     "RUN: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [FILE|-]\n"
     "\n"
@@ -121,9 +121,9 @@ static const char manual_text[] =
     "  shell ls -1        Insert shell stdout at cursor (one undo).\n"
     "  filter sort        Replace document with stdout of a filter (one undo).\n"
     "  filter-lines 3-9 sort  Filter only numbered complete lines.\n"
-    "  define files shell ls -1  Save a custom command; type files to use.\n"
+    "  define dirlist shell ls -1  Save a command; type dirlist to use.\n"
     "  functions          List commands; functions reload refreshes.\n"
-    "  undefine files     Remove a user-defined command.\n"
+    "  undefine dirlist   Remove a user-defined command.\n"
     "  run ~/commands.editor  Execute a trusted plaintext command script.\n"
     "  ls [DIRECTORY]     Browse folders; Tab completes paths after commands.\n"
     "  copy/cut [N|A-B]   Copy or cut lines to the clipboard.\n"
@@ -170,7 +170,16 @@ static const char manual_extension[] =
     "  Each script edit is its own undo step; no rollback of earlier steps.\n"
     "  Definitions: ~/.config/editor/commands.conf (XDG override).\n"
     "  User names are lowercase ASCII; built-in commands cannot be redefined.\n"
+    "  A direct user command runs like typed input, including normal prompts.\n"
+    "  define q1 quit! makes q1 discard unsaved edits and exit when invoked.\n"
+    "  Scripts retain their restricted commands, including through aliases.\n"
+    "  A failed script search stops later steps; earlier edits remain undoable.\n"
     "  See help shell, help filter, help define, help run for details.\n"
+    "\n"
+    "PASTE: An idle or cancelled paste is discarded through its end marker.\n"
+    "  After five idle seconds, a notice appears; late bytes cannot run commands.\n"
+    "  If the terminal lost the marker, make a small fresh paste to finish\n"
+    "  discarding, then paste the wanted text again. Both drafts stay intact.\n"
     "\n"
     "SIGNALS: Ctrl-C/Z remain terminal controls (including remapping).\n"
     "  Interrupt exits, LOSING UNSAVED TEXT; stop suspends (fg resumes).\n"
@@ -375,6 +384,8 @@ static int menu_number = -1;
 typedef struct { int code; char name[24], action[256]; } Binding;
 static Binding binds[MAX_BINDINGS];
 static size_t bind_count;
+static struct stat bindings_version;
+static bool bindings_loaded, bindings_version_valid;
 static char binds_page[16384];
 /* Explicitly invoked, user-owned command definitions. None execute on load. */
 #define USER_CMD_MAX 32
@@ -387,6 +398,7 @@ static UserCommand user_commands[USER_CMD_MAX];
 static size_t user_command_count;
 static struct stat user_commands_version;
 static bool user_commands_version_valid, user_commands_loaded;
+static bool user_commands_sync_warning;
 static unsigned script_steps, script_depth;
 static bool external_cancel_notice;
 
@@ -410,9 +422,11 @@ static bool reserve(Buffer *b, size_t n)
     return true;
 }
 
+static void layout_reset(void);
 static bool copy_buffer(Buffer *b, const char *s, size_t n)
 {
     if (n == SIZE_MAX || (n && !s)) { errno = EINVAL; return false; }
+    if (b == &text) layout_reset();
     if (!reserve(b, n + 1)) return false;
     if (n) memcpy(b->s, s, n);
     b->s[n] = 0; b->n = n;
@@ -554,23 +568,18 @@ static size_t prev_pos(const char *s, size_t n, size_t p)
     return p - 1;
 }
 
-static size_t line_start(size_t p)
-{
-    while (p && text.s[p-1] != '\n') p--;
-    return p;
-}
-
 static size_t line_end(size_t p)
 {
-    while (p < text.n && text.s[p] != '\n') p++;
+    const char *lf = p < text.n ? memchr(text.s+p,'\n',text.n-p) : NULL;
+    p = lf ? (size_t)(lf-text.s) : text.n;
     if (p < text.n && p && text.s[p-1] == '\r') p--;
     return p;
 }
 
 static size_t next_line(size_t p)
 {
-    while (p < text.n && text.s[p] != '\n') p++;
-    return p < text.n ? p + 1 : text.n;
+    const char *lf = p < text.n ? memchr(text.s+p,'\n',text.n-p) : NULL;
+    return lf ? (size_t)(lf-text.s)+1 : text.n;
 }
 
 /* Convert a unit to printable bytes and its terminal-cell width. */
@@ -601,10 +610,111 @@ static size_t representation(const char *s, size_t n, size_t p, size_t column,
     return count;
 }
 
+/* Sparse, expendable position information bounds rescanning while scrolling
+ * near EOF or across a long line. One checkpoint per 4096 bytes costs at most
+ * 64 KiB plus one 32-byte checkpoint on a 64-bit host. Text and undo remain
+ * the sole authoritative data.
+ * Checkpoints lie at decoded-unit boundaries, including CRLF boundaries. */
+#define LAYOUT_STEP 4096
+typedef struct { size_t byte, line, start, column; } LayoutPoint;
+static LayoutPoint layout_points[LIMIT / LAYOUT_STEP + 1];
+static size_t layout_count;
+static LayoutPoint layout_recent;
+
+static void layout_reset(void)
+{
+    layout_count=1;
+    layout_points[0]=(LayoutPoint){0,1,0,0};
+    layout_recent=layout_points[0];
+}
+
+static void layout_invalidate(size_t at)
+{
+    /* A byte edit can complete a formerly invalid UTF-8 sequence or CRLF
+     * starting just before it. Keep only checkpoints before that overlap. */
+    size_t safe=at>3 ? at-3 : 0;
+    if (!layout_count) layout_reset();
+    while (layout_count>1 && layout_points[layout_count-1].byte>safe)
+        layout_count--;
+    if (layout_recent.byte>safe) layout_recent=layout_points[layout_count-1];
+}
+
+static void layout_advance(LayoutPoint *point, size_t limit)
+{
+    unsigned char c=(unsigned char)text.s[point->byte];
+    size_t count;
+    uint32_t cp;
+    int width;
+    if (c=='\n' || (c=='\r' && point->byte+1<limit &&
+                     text.s[point->byte+1]=='\n')) {
+        point->byte+=c=='\r' ? 2 : 1;
+        point->line++; point->start=point->byte; point->column=0;
+    } else if (c<128) {
+        point->byte++;
+        point->column+=c=='\t' ? 8-point->column%8 :
+                       c>=32 && c<127 ? 1u : 2u;
+    } else {
+        count=decode(text.s,limit,point->byte,&cp);
+        point->byte+=count;
+        if (cp==0xffffffffu) point->column+=4;
+        else if ((width=wcwidth((wchar_t)cp))>0) point->column+=(size_t)width;
+        else {
+            /* representation() writes \\u{HEX}; counting its cells needs
+             * no temporary string or formatting call for every code point. */
+            point->column+=4;
+            do {point->column++;cp>>=4;} while (cp);
+        }
+    }
+}
+
+static LayoutPoint layout_at(size_t p)
+{
+    LayoutPoint point;
+    size_t lo=0,hi,mid;
+    if (!layout_count) layout_reset();
+    if (p>text.n) p=text.n;
+    if (layout_recent.byte==p) return layout_recent;
+    point=layout_points[layout_count-1];
+    if (layout_recent.byte>point.byte && layout_recent.byte<p)
+        point=layout_recent;
+    while (point.byte<p) {
+        layout_advance(&point,text.n);
+        if (layout_count<sizeof layout_points/sizeof *layout_points &&
+            point.byte>=layout_count*LAYOUT_STEP)
+            layout_points[layout_count++]=point;
+    }
+    if (point.byte==p) {layout_recent=point;return point;}
+    hi=layout_count;
+    while (lo+1<hi) {
+        mid=lo+(hi-lo)/2;
+        if (layout_points[mid].byte<=p) lo=mid; else hi=mid;
+    }
+    point=layout_points[lo];
+    if (layout_recent.byte>point.byte && layout_recent.byte<p)
+        point=layout_recent;
+    /* Truncate decoding at p, matching the display of a search which lands
+     * inside a malformed or partial UTF-8 unit. */
+    while (point.byte<p) {
+        LayoutPoint next=point;
+        layout_advance(&next,text.n);
+        if (next.byte>p) {
+            /* A truncated unit is a valid query, not a reusable checkpoint. */
+            while (point.byte<p) layout_advance(&point,p);
+            return point;
+        }
+        point=next;
+    }
+    layout_recent=point;return point;
+}
+
+static size_t line_start(size_t p) { return layout_at(p).start; }
+
 static size_t column_at(size_t start, size_t p)
 {
+    LayoutPoint point=layout_at(p);
     size_t column = 0;
     char rep[32]; int width; bool wide;
+    if (point.start==start) return point.column;
     while (start < p) {
         start += representation(text.s, p, start, column, rep, &width, &wide);
         column += (size_t)width;
@@ -615,7 +725,21 @@ static size_t column_at(size_t start, size_t p)
 static size_t position_at(size_t start, size_t column)
 {
     size_t end = line_end(start), x = 0, count;
+    size_t lo=0,hi=layout_count,mid;
     char rep[32]; int width; bool wide;
+    /* Existing checkpoints can skip the off-screen prefix. Do not build
+     * the rest of a long line merely to move to one of its first columns. */
+    while (lo<hi) {
+        const LayoutPoint *point;
+        mid=lo+(hi-lo)/2; point=&layout_points[mid];
+        if (point->start<start ||
+            (point->start==start && point->column<=column)) lo=mid+1;
+        else hi=mid;
+    }
+    if (lo && layout_points[lo-1].start==start &&
+        layout_points[lo-1].byte<=end) {
+        x=layout_points[lo-1].column; start=layout_points[lo-1].byte;
+    }
     while (start < end) {
         count = representation(text.s, end, start, x, rep, &width, &wide);
         if (x + (size_t)width > column) break;
@@ -687,10 +811,7 @@ static bool find_match(bool forward, bool include_current)
     }
     /* Compute the message before committing cursor/mark, so cancellation
      * also leaves navigation unchanged while counting a long prefix. */
-    for (i=0,line_no=1; i<selected; i++) {
-        if (!(i & 8191u) && (terminated || suspended || interrupted)) goto cancelled;
-        if (text.s[i]=='\n') line_no++;
-    }
+    line_no=layout_at(selected).line;
     from=line_start(selected);
     i=column_at(from,selected)+1;
     if (terminated || suspended || interrupted) goto cancelled;
@@ -704,15 +825,15 @@ cancelled:
 
 /* The Find> prompt is text, not another command to parse. In particular,
  * leading/trailing spaces and a whitespace-only search are meaningful. */
-static void start_search(const char *pattern)
+static bool start_search(const char *pattern)
 {
     size_t length = strlen(pattern);
     if (!length || length >= sizeof search_pattern) {
-        tell("Search text must be 1-%d bytes.", COMMAND_SIZE - 1); return;
+        tell("Search text must be 1-%d bytes.", COMMAND_SIZE - 1); return false;
     }
     memcpy(search_pattern, pattern, length + 1);
     search_length = length; search_mark = SIZE_MAX;
-    (void)find_match(true, true);
+    return find_match(true, true);
 }
 
 /* Replacement uses the same edit transactions as normal typing.  In the all
@@ -803,6 +924,7 @@ static bool replace_bytes(size_t at, size_t old_n, const char *s, size_t n)
         return false;
     length = text.n - old_n + n;
     if (!reserve(&text, length + 1)) return false;
+    layout_invalidate(at);
     memmove(text.s + at + n, text.s + at + old_n, text.n - at - old_n);
     if (n) memcpy(text.s + at, s, n);
     text.n = length; text.s[length] = 0;
@@ -979,6 +1101,7 @@ static char *resolve_path(const char *name)
 static bool read_stream(int fd, Buffer *b)
 {
     char chunk[8192]; ssize_t n;
+    if (b==&text) layout_reset();
     for (;;) {
         if (terminated || suspended || interrupted) { errno = EINTR; return false; }
         n = read(fd, chunk, sizeof chunk);
@@ -1001,6 +1124,7 @@ static bool read_file(const char *path, Buffer *b, struct stat *st)
     struct stat after;
     char chunk[8192]; ssize_t n;
     bool ok = false;
+    if (b==&text) layout_reset();
     if (fd < 0) return false;
     if (fstat(fd, st) < 0) goto done;
     if (!S_ISREG(st->st_mode)) { errno = EINVAL; goto done; }
@@ -1699,11 +1823,15 @@ static const CommandHelp command_info[] = {
     {"define", "def", "define NAME COMMAND",
      "Save a single-line command definition under NAME; invoke the NAME directly at "
      "Command>. Use define NAME run FILE to bind it to a multi-line script. "
+     "Direct aliases retain ordinary prompts and unsaved-work checks; scripts "
+     "keep their restricted command set, including inside aliases. "
      "Names are lowercase ASCII; built-in commands and aliases cannot be replaced. "
      "Definitions load as inert data; nothing runs on startup.",
      6, "Assign a saved user-defined name to an editor command.",
-     "define files shell ls -1\n"
-     "  Define files; type files to insert a listing.\n"
+     "define dirlist shell ls -1\n"
+     "  Define dirlist; type dirlist to insert a listing.\n"
+     "define q1 quit!\n"
+     "  Define q1 to discard unsaved edits and exit when explicitly invoked.\n"
      "define clean run /home/user/clean.editor\n"
      "  Save a custom script command.\n"
      "functions\n"
@@ -1712,8 +1840,8 @@ static const CommandHelp command_info[] = {
      "Remove a named user command from the persistent commands.conf file. "
      "Changes are saved atomically; a changed external configuration is not overwritten.",
      6, "Remove one saved custom command.",
-     "undefine files\n"
-     "  Remove the user-defined files command."},
+     "undefine dirlist\n"
+     "  Remove the user-defined dirlist command."},
     {"functions", "user-commands, definitions", "functions [reload]",
      "List user-defined commands or reload their secure plaintext definitions from disk. "
      "Stored in ~/.config/editor/commands.conf (or XDG_CONFIG_HOME/editor). "
@@ -2518,80 +2646,153 @@ static void show_settings(void)
 static void load_bindings(void)
 {
     Buffer b = {0};
-    char *line;
+    char *line, *path;
+    int result;
+    bool valid = true;
+    bindings_loaded = bindings_version_valid = false;
+    bind_count = 0;
     if (keys_disabled) return;
-    if (read_config("keys.conf", &b) != 1) { free(b.s); return; }
+    path = keymap_path(false);
+    if (!path) { bindings_loaded = errno == ENOENT; return; }
+    result = read_config_file(path, &b, &bindings_version);
+    free(path);
+    if (result != 1) {
+        bindings_loaded = result == 0;
+        free(b.s); return;
+    }
+    bindings_version_valid = true;
     line = b.s;
-    while (line && *line) {
+    while (line) {
         char *next = strchr(line, '\n'), *key, *action, *end;
         if (next) *next++ = 0;
         end = line + strlen(line);
         while (end > line && (end[-1] == '\r' || end[-1] == '\n')) *--end = 0;
-        if (strlen(line) < 512 && !strncmp(line, "bind ", 5)) {
+        while (*line == ' ' || *line == '\t') line++;
+        if (!*line || *line == '#') { line = next; continue; }
+        if (strlen(line) < 512 && !strncmp(line, "bind", 4) &&
+            (line[4] == ' ' || line[4] == '\t')) {
             key = line + 5;
-            while (*key == ' ') key++;
+            while (*key == ' ' || *key == '\t') key++;
             action = key;
             while (*action && *action != ' ' && *action != '\t') action++;
             if (*action) {
+                const unsigned char *p;
+                bool printable = true;
                 *action++ = 0;
                 while (*action == ' ' || *action == '\t') action++;
-                if (*action) (void)binding_assign(key, action);
-            }
-        }
+                for (p = (const unsigned char *)action; *p; p++)
+                    if ((*p < 32 && *p != '\t') || *p == 127) printable = false;
+                if (!*action || !printable || !binding_assign(key, action)) valid = false;
+            } else valid = false;
+        } else valid = false;
         line = next;
     }
+    /* Preserve valid session bindings, but do not rewrite a file containing
+     * unsupported entries and silently delete them from persistent storage. */
+    bindings_loaded = valid;
     free(b.s);
+}
+
+static bool bindings_bytes_match(const Buffer *b)
+{
+    static const char header[] = "# editor user-defined keys; no built-in hotkeys\n";
+    size_t at = sizeof header - 1;
+    if (b->n < at || memcmp(b->s, header, at)) return false;
+    for (size_t i = 0; i < bind_count; i++) {
+        char line[320];
+        int n = snprintf(line, sizeof line, "bind %s %s\n", binds[i].name, binds[i].action);
+        if (n < 0 || (size_t)n >= sizeof line || (size_t)n > b->n - at ||
+            memcmp(b->s + at, line, (size_t)n)) return false;
+        at += (size_t)n;
+    }
+    return at == b->n;
 }
 
 static bool save_bindings(void)
 {
-    char *path = keymap_path(true), *tmp;
+    char *path = NULL, *tmp = NULL, *dir = NULL, *slash;
+    Buffer verified = {0};
     size_t i;
-    int fd = -1, dir_fd;
-    struct stat st;
+    int fd = -1, dir_fd = -1, error = 0;
+    struct stat st, written, directory;
     bool ok = false, temporary_created = false;
+    if (keys_disabled) { errno = EACCES; return false; }
+    if (!bindings_loaded) { errno = EINVAL; return false; }
+    path = keymap_path(true);
     if (!path) return false;
     if (lstat(path, &st) == 0) {
-        if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077))
-            goto done;
-    } else if (errno != ENOENT) goto done;
+        if (!bindings_version_valid || !same_disk_version(&st, &bindings_version)) {
+            errno = EAGAIN; goto done;
+        }
+        if (!(st.st_mode & S_IWUSR)) { errno = EACCES; goto done; }
+        if (st.st_nlink != 1) { errno = EMLINK; goto done; }
+    } else if (errno != ENOENT || bindings_version_valid) {
+        if (errno == ENOENT) errno = EAGAIN;
+        goto done;
+    }
+    dir = strdup(path);
+    if (!dir) goto done;
+    slash = strrchr(dir, '/'); *slash = 0;
+    dir_fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 || fstat(dir_fd, &directory) < 0) goto done;
+    if (directory.st_uid != geteuid() || (directory.st_mode & 022)) {
+        errno = EACCES; goto done;
+    }
     tmp = join_strings(path, ".XXXXXX", "");
     if (!tmp) goto done;
     fd = mkstemp(tmp);
-    if (fd < 0) goto temp_done;
+    if (fd < 0) goto done;
     temporary_created = true;
     if (fchmod(fd, 0600) < 0 ||
         write_all(fd, "# editor user-defined keys; no built-in hotkeys\n",
-                  strlen("# editor user-defined keys; no built-in hotkeys\n")) < 0) goto temp_done;
+                  strlen("# editor user-defined keys; no built-in hotkeys\n")) < 0) goto done;
     for (i = 0; i < bind_count; i++) {
         char line[320];
         int len = snprintf(line, sizeof line, "bind %s %s\n", binds[i].name, binds[i].action);
         if (len < 0 || (size_t)len >= sizeof line || write_all(fd, line, (size_t)len) < 0)
-            goto temp_done;
+            goto done;
     }
     /* Do not lose the descriptor if synchronization fails before close. */
-    if (sync_fd(fd) < 0) goto temp_done;
-    if (close(fd) < 0) { fd = -1; goto temp_done; }
+    if (sync_fd(fd) < 0 || fstat(fd, &written) < 0) goto done;
+    if (close(fd) < 0) { fd = -1; goto done; }
     fd = -1;
-    if (io_cancelled() || rename(tmp, path) < 0) goto temp_done;
-    { char *slash = strrchr(path, '/');
-      if (slash) {
-          *slash = 0; dir_fd = open(path, O_RDONLY);
-          if (dir_fd >= 0) { (void)sync_fd(dir_fd); close(dir_fd); }
-          *slash = '/';
-      }
+    if (lstat(dir, &st) < 0) goto done;
+    if (!S_ISDIR(st.st_mode) || st.st_dev != directory.st_dev ||
+        st.st_ino != directory.st_ino || st.st_uid != geteuid() || (st.st_mode & 022)) {
+        errno = EAGAIN; goto done;
     }
+    if (bindings_version_valid) {
+        if (lstat(path, &st) < 0) { if (errno == ENOENT) errno = EAGAIN; goto done; }
+        if (!same_disk_version(&st, &bindings_version)) { errno = EAGAIN; goto done; }
+        if (io_cancelled() || rename(tmp, path) < 0) goto done;
+        temporary_created = false;
+    } else {
+        /* Never replace a keymap first created while this save was staged. */
+        if (io_cancelled() || link(tmp, path) < 0) goto done;
+        if (unlink(tmp) == 0) temporary_created = false;
+    }
+    bindings_version = written; bindings_version_valid = true;
+    /* A post-rename stat alone can adopt a same-inode outside rewrite as our
+     * saved version. Verify the exact serialized bytes and a stable read
+     * before accepting the post-publish ctime/link-count changes. */
+    if (read_config_file(path, &verified, &st) == 1 &&
+        st.st_dev == written.st_dev && st.st_ino == written.st_ino &&
+        st.st_size == written.st_size && st.st_mode == written.st_mode &&
+        st.st_uid == written.st_uid && st.st_gid == written.st_gid &&
+        st.st_nlink == 1 && st.st_mtim.tv_sec == written.st_mtim.tv_sec &&
+        st.st_mtim.tv_nsec == written.st_mtim.tv_nsec && bindings_bytes_match(&verified))
+        bindings_version = st;
+    /* A committed keymap remains saved even if post-commit synchronization
+     * is unavailable; do not misreport it as a session-only assignment. */
+    (void)sync_fd(dir_fd);
     ok = true;
-temp_done:
-    { int error = errno;
-      if (fd >= 0) close(fd);
-      /* A failed mkstemp transfers no file, even if it changed the template. */
-      if (!ok && temporary_created) (void)unlink(tmp);
-      errno = error;
-    }
-    free(tmp);
 done:
-    free(path);
+    error = errno;
+    if (fd >= 0) close(fd);
+    if (dir_fd >= 0) close(dir_fd);
+    /* A failed mkstemp transfers no file, even if it changed the template. */
+    if (temporary_created) (void)unlink(tmp);
+    free(verified.s); free(tmp); free(dir); free(path); errno = error;
     return ok;
 }
 
@@ -3269,9 +3470,10 @@ static void dimensions(void)
     reset_screen(); resized = 0;
 }
 
-static void visible(Buffer *b, const char *s, size_t n, size_t from, size_t width)
+static void visible_from(Buffer *b, const char *s, size_t n, size_t from,
+                         size_t width, size_t p, size_t x)
 {
-    size_t p = 0, x = 0, count, a, z, k;
+    size_t count, a, z, k;
     int cells; bool wide; char rep[32];
     b->n = 0;
     if (b->s) b->s[0] = 0;
@@ -3288,10 +3490,16 @@ static void visible(Buffer *b, const char *s, size_t n, size_t from, size_t widt
     }
 }
 
-static void visible_match(Buffer *b, const char *s, size_t n, size_t from,
-                          size_t width, size_t match_from, size_t match_to)
+static void visible(Buffer *b, const char *s, size_t n, size_t from, size_t width)
 {
-    size_t p=0,x=0,count,a,z,k;
+    visible_from(b,s,n,from,width,0,0);
+}
+
+static void visible_match(Buffer *b, const char *s, size_t n, size_t from,
+                          size_t width, size_t match_from, size_t match_to,
+                          size_t p, size_t x)
+{
+    size_t count,a,z,k;
     int cells; bool wide, active=false, within;
     char rep[32];
     b->n=0;
@@ -3686,14 +3894,22 @@ static void draw(void)
     if (col >= left + (size_t)(cols - 1)) left = col - (size_t)(cols - 2);
     p = top;
     for (r = 0; r < body; r++) {
+        size_t screen_p,screen_x;
         if (p == start) cursor_row = r;
         end = line_end(p);
+        screen_p=p;screen_x=0;
+        if (left) {
+            screen_p=position_at(p,left);
+            screen_x=column_at(p,screen_p);
+        }
         if (search_mark!=SIZE_MAX && search_length && search_mark>=p &&
             search_mark<end && search_length<=text.n-search_mark &&
             !memcmp(text.s+search_mark,search_pattern,search_length))
             visible_match(&line,text.s+p,end-p,left,(size_t)(cols-1),
-                          search_mark-p,search_mark-p+search_length);
-        else visible(&line,text.s ? text.s+p : "",end-p,left,(size_t)(cols-1));
+                          search_mark-p,search_mark-p+search_length,
+                          screen_p-p,screen_x);
+        else visible_from(&line,text.s ? text.s+p : "",end-p,left,
+                          (size_t)(cols-1),screen_p-p,screen_x);
         draw_row(&out, r, &line, false);
         if (end < text.n) p = next_line(p);
         else {
@@ -3702,7 +3918,7 @@ static void draw(void)
             break;
         }
     }
-    for (p = 0; p < cursor; p++) if (text.s[p] == '\n') line_number++;
+    line_number=layout_at(cursor).line;
     dirty = changed(); width = (size_t)(cols - 1);
     name = filename ? strrchr(filename, '/') + 1 : "[new file]";
     snprintf(info, sizeof info, "%zu:%zu | ", line_number, col + 1);
@@ -3778,6 +3994,18 @@ static void draw(void)
         output(&out, address);
     }
 finish:
+    /* A command draft, menu, or viewer normally owns the footer. While an
+     * incomplete paste is being drained, show why input is not active without
+     * replacing that context or discarding its draft. */
+    if (paste_discard && !drawing_failed) {
+        static const char waiting[] =
+            "Paste incomplete; waiting for end marker. Paste again to reset, then retry.";
+        line.n = 0;
+        visible(&line, waiting, sizeof waiting - 1, 0,
+                (size_t)(cols > 1 ? cols - 1 : 0));
+        draw_row(&out, rows - 1, &line, true);
+        output(&out, "\033[?25l");
+    }
     if (drawing_failed) {
         static const char low_memory[] =
             "\033[0m\033[H\033[KLow memory; text retained.\033[?25h";
@@ -4139,12 +4367,13 @@ done:
 /* Keep a stale editor from silently replacing another session's definitions. */
 static bool save_user_command_table(const UserCommand *items, size_t count)
 {
-    Buffer b={0};
-    char *path=NULL,*check=NULL;
-    struct stat st;
+    Buffer b={0}, verified={0};
+    char *path=NULL,*check=NULL,*tmp=NULL,*dir=NULL,*slash;
+    struct stat st, directory, written, confirmed;
     size_t i;
-    bool ok=false;
-    int error=0;
+    bool ok=false, temporary_created=false;
+    int error=0, fd=-1, dfd=-1;
+    user_commands_sync_warning=false;
     if (!user_commands_loaded || count>USER_CMD_MAX) {errno=EINVAL;return false;}
     check=config_path("commands.conf",false);
     if (!check && errno!=ENOENT) return false;
@@ -4153,6 +4382,8 @@ static bool save_user_command_table(const UserCommand *items, size_t count)
             if (!user_commands_version_valid || !same_disk_version(&st,&user_commands_version)) {
                 error=EAGAIN;goto done;
             }
+            if (!(st.st_mode & S_IWUSR)) {error=EACCES;goto done;}
+            if (st.st_nlink!=1) {error=EMLINK;goto done;}
         } else if (errno!=ENOENT || user_commands_version_valid) {
             error=errno==ENOENT ? EAGAIN : errno;goto done;
         }
@@ -4166,14 +4397,58 @@ static bool save_user_command_table(const UserCommand *items, size_t count)
         memcpy(b.s+b.n,items[i].name,a);b.n+=a;b.s[b.n++]='\t';
         memcpy(b.s+b.n,items[i].body,z);b.n+=z;b.s[b.n++]='\n';b.s[b.n]=0;
     }
-    if (!private_write(path,b.s ? b.s : "",b.n,false)) {error=errno;goto done;}
-    if (lstat(path,&st)<0) {error=errno;goto done;}
-    /* The committed file is authoritative even if stat afterward fails. */
-    memcpy(user_commands,items,count*sizeof *items);
-    user_command_count=count;user_commands_version=st;user_commands_version_valid=true;
+    dir=strdup(path);
+    if (!dir) {error=errno;goto done;}
+    slash=strrchr(dir,'/'); *slash=0;
+    dfd=open(dir,O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dfd<0 || fstat(dfd,&directory)<0) {error=errno;goto done;}
+    if (directory.st_uid!=geteuid() || (directory.st_mode & 022)) {
+        error=EACCES;goto done;
+    }
+    tmp=join_strings(path,".XXXXXX","");
+    if (!tmp) {error=errno;goto done;}
+    fd=mkstemp(tmp);
+    if (fd<0) {error=errno;goto done;}
+    temporary_created=true;
+    if (fchmod(fd,0600)<0 || write_all(fd,b.s ? b.s : "",b.n)<0 ||
+        sync_fd(fd)<0 || fstat(fd,&written)<0) {error=errno;goto done;}
+    if (close(fd)<0) {fd=-1;error=errno;goto done;}
+    fd=-1;
+    if (lstat(dir,&st)<0) {error=errno;goto done;}
+    if (!S_ISDIR(st.st_mode) || st.st_dev!=directory.st_dev ||
+        st.st_ino!=directory.st_ino || st.st_uid!=geteuid() || (st.st_mode & 022)) {
+        error=EAGAIN;goto done;
+    }
+    /* Check again after staging: a second editor may have saved while the
+     * temporary file was being written or synchronized. An initially absent
+     * destination is published without replacing any new arrival. */
+    if (user_commands_version_valid) {
+        if (lstat(path,&st)<0) {error=errno==ENOENT ? EAGAIN : errno;goto done;}
+        if (!same_disk_version(&st,&user_commands_version)) {error=EAGAIN;goto done;}
+        if (io_cancelled() || rename(tmp,path)<0) {error=errno;goto done;}
+        temporary_created=false;
+    } else {
+        if (io_cancelled() || link(tmp,path)<0) {error=errno;goto done;}
+        if (unlink(tmp)==0) temporary_created=false;
+    }
     ok=true;
+    /* The write is committed. Keep the new in-memory table even if a later
+     * metadata check fails, and never adopt an unrelated replacement's
+     * identity as permission to overwrite it on the next save. */
+    memcpy(user_commands,items,count*sizeof *items);
+    user_command_count=count;user_commands_version=written;user_commands_version_valid=true;
+    if (lstat(path,&st)==0 && st.st_dev==written.st_dev && st.st_ino==written.st_ino &&
+        st.st_size==written.st_size && st.st_mtim.tv_sec==written.st_mtim.tv_sec &&
+        st.st_mtim.tv_nsec==written.st_mtim.tv_nsec &&
+        read_config_file(path,&verified,&confirmed)==1 &&
+        same_disk_version(&st,&confirmed) && same_bytes(&b,&verified))
+        user_commands_version=confirmed;
+    if (sync_fd(dfd)<0) user_commands_sync_warning=true;
 done:
-    free(check);free(path);free(b.s);
+    if (fd>=0) (void)close(fd);
+    if (temporary_created) (void)unlink(tmp);
+    if (dfd>=0) (void)close(dfd);
+    free(check);free(path);free(tmp);free(dir);free(b.s);free(verified.s);
     if (!ok) errno=error ? error : EIO;
     return ok;
 }
@@ -4209,7 +4484,8 @@ static bool change_user_command(const char *name, const char *body)
         tell("Command NOT saved: %s. Reload with functions reload if another editor changed it.",strerror(errno));
     } else {
         okay=true;
-        tell("%s user command %s. Saved in commands.conf.",body ? "Defined" : "Removed",name);
+        tell("%s user command %s. Saved in commands.conf.%s",body ? "Defined" : "Removed",name,
+             user_commands_sync_warning ? " Directory synchronization unavailable." : "");
     }
 done:
     free(copy);return okay;
@@ -4700,6 +4976,7 @@ static void clip_history_use(size_t number)
  * copying its bytes. The only active buffer is owned by the editor globals. */
 static void document_capture(DocumentContext *d)
 {
+    layout_reset();
     memset(d,0,sizeof *d);
     d->text=text; d->saved=saved;
     d->cursor=cursor; d->top=top; d->left=left; d->goal=goal;
@@ -4727,6 +5004,7 @@ static void document_capture(DocumentContext *d)
 }
 static void document_restore(DocumentContext *d)
 {
+    layout_reset();
     free_changes(history); free(text.s); free(saved.s);
     free(filename); free(loaded_journal_path);
     text=d->text; saved=d->saved;
@@ -4795,7 +5073,7 @@ static void read_document(const char *name)
         !reserve(&fresh,fresh.n+1)) { errno=ENOMEM;goto failure; }
     fresh.s[fresh.n]=0;
     free_changes(history); history=current=history_tail=NULL;
-    free(text.s);text=fresh;memset(&fresh,0,sizeof fresh);
+    free(text.s);text=fresh;memset(&fresh,0,sizeof fresh);layout_reset();
     free(saved.s);saved=fresh_saved;memset(&fresh_saved,0,sizeof fresh_saved);
     free(filename);filename=path;path=NULL;
     existed=present; if (present) original=st; else memset(&original,0,sizeof original);
@@ -5093,7 +5371,16 @@ static void paste(void)
             break;
         }
         if (c < 0) {
-            if (++idle >= 20) { tell("Paste timed out; text unchanged."); break; }
+            if (++idle >= 20) {
+                /* Idle time is not an end marker. A slow or interrupted
+                 * terminal can resume this same paste later; interpreting
+                 * its tail as keys could insert fragments or run commands.
+                 * Release the staged text, but retain the framing until the
+                 * real terminator arrives (possibly with a fresh paste). */
+                paste_discard = true; paste_end_matched = matched;
+                tell("Paste incomplete; waiting for end marker. Text unchanged.");
+                break;
+            }
             if (resized) draw();
             continue;
         }
@@ -5102,7 +5389,7 @@ static void paste(void)
             matched++;
             if (matched == sizeof end - 1) {
                 if (ignored) {
-                    if (draining) { tell("Cancelled paste discarded; document unchanged."); resized=1; }
+                    if (draining) { tell("Incomplete or cancelled paste discarded; text unchanged."); resized=1; }
                     free(b.s); return;
                 }
                 if (rejected) {
@@ -5368,24 +5655,31 @@ static void command_browse(int direction)
  */
 static size_t line_count(void)
 {
-    size_t i, count = 1;
-    for (i = 0; i < text.n; i++) if (text.s[i] == '\n') count++;
-    return count;
+    return layout_at(text.n).line;
 }
 static size_t numbered_line(size_t number)
 {
-    size_t i, line = 1;
-    /* A single pass also detects an out-of-range line number. */
+    size_t i=0,line=1,lo=0,hi=layout_count,mid;
+    if (!layout_count) {layout_reset();hi=layout_count;}
     if (!number) return SIZE_MAX;
     if (number == 1) return 0;
-    for (i = 0; i < text.n; i++) if (text.s[i] == '\n' && ++line == number) return i+1;
+    while (lo+1<hi) {
+        mid=lo+(hi-lo)/2;
+        if (layout_points[mid].line<=number) lo=mid; else hi=mid;
+    }
+    if (layout_points[lo].line==number) return layout_points[lo].start;
+    i=layout_points[lo].byte; line=layout_points[lo].line;
+    while (i<text.n) {
+        const char *lf=memchr(text.s+i,'\n',text.n-i);
+        if (!lf) break;
+        i=(size_t)(lf-text.s)+1;
+        if (++line==number) return i;
+    }
     return SIZE_MAX;
 }
 static size_t current_line_number(void)
 {
-    size_t i, line = 1;
-    for (i = 0; i < cursor; i++) if (text.s[i] == '\n') line++;
-    return line;
+    return layout_at(cursor).line;
 }
 static void delete_line_range(size_t first, size_t last)
 {
@@ -5473,12 +5767,17 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
 {
     FILE *input_file=NULL;
     int out[2]={-1,-1}, err[2]={-1,-1}, status=0, error=0;
-    int io[2], i;
+    int io[2]={-1,-1}, i;
     pid_t pid=-1, waited=-1;
-    bool cr=false, good=true;
+    bool cr=false, good=true, child_owned=false, child_signals=false;
+    struct sigaction previous_chld, default_chld;
     size_t stderr_used=0;
     char stderr_text[256]={0};
     if (!cmd || !*cmd) { snprintf(report,report_n,"Shell command required."); return false; }
+    if (io_cancelled()) {
+        snprintf(report,report_n,"Command stopped; output discarded (interrupted).");
+        return false;
+    }
     if (input_bytes) {
         input_file=tmpfile();
         if (!input_file || (input_n && fwrite(input_bytes,1,input_n,input_file)!=input_n) ||
@@ -5492,6 +5791,23 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
         good=false;error=errno;snprintf(report,report_n,"Cannot create process pipes: %s.",strerror(error));
         goto failed;
     }
+    /* An inherited SIGCHLD ignore/SA_NOCLDWAIT would discard exit status
+     * before waitpid can inspect it. Temporarily request waitable children;
+     * restore the original disposition after this synchronous operation. */
+    memset(&default_chld,0,sizeof default_chld);
+    default_chld.sa_handler=SIG_DFL;
+    sigemptyset(&default_chld.sa_mask);
+    if (sigaction(SIGCHLD,&default_chld,&previous_chld)<0) {
+        good=false;snprintf(report,report_n,"Cannot prepare child signals: %s.",strerror(errno));
+        goto failed;
+    }
+    child_signals=true;
+    /* Preparation can succeed even when a handler ran during the syscall.
+     * Do not launch a command after cancellation has already been requested. */
+    if (io_cancelled()) {
+        good=false;snprintf(report,report_n,"Command stopped; output discarded (interrupted).");
+        goto failed;
+    }
     pid=fork();
     if (pid<0) {
         good=false;error=errno;snprintf(report,report_n,"Cannot fork: %s.",strerror(error));
@@ -5499,6 +5815,7 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
     }
     if (pid==0) {
         int source=-1;
+        if (io_cancelled()) _exit(127);
         /* Independent group so cancellation also stops a shell pipeline. */
         (void)setpgid(0,0);
         if (input_file) source=fileno(input_file);
@@ -5511,21 +5828,38 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
         /* The child gets default signals; our editor handlers are not inherited. */
         signal(SIGINT,SIG_DFL);signal(SIGTERM,SIG_DFL);
         signal(SIGQUIT,SIG_DFL);signal(SIGPIPE,SIG_DFL);
+#ifdef SIGXFSZ
+        signal(SIGXFSZ,SIG_DFL);
+#endif
         execl("/bin/sh","sh","-c",cmd,(char *)NULL);
         _exit(127);
     }
+    child_owned=true;
     (void)setpgid(pid,pid); /* Child may already have exec'd. */
     close(out[1]);out[1]=-1;close(err[1]);err[1]=-1;
-    io[0]=out[0];io[1]=err[0];
+    io[0]=out[0];out[0]=-1;io[1]=err[0];err[0]=-1;
     for(i=0;i<2;i++) {
         int flags=fcntl(io[i],F_GETFL);
         if (flags<0 || fcntl(io[i],F_SETFL,flags|O_NONBLOCK)<0) {
             good=false; error=errno;break;
         }
     }
-    while (good && (io[0]>=0 || io[1]>=0)) {
+    while (good) {
         struct pollfd fds[2]; nfds_t count=0;
         if (io_cancelled()) {good=false;error=EINTR;break;}
+        if (io[0]<0 && io[1]<0) {
+            /* EOF on both pipes does not mean the process has exited. Keep
+             * cancellation responsive if it closes output and then blocks.
+             * Defer reaping until EOF so the process-group ID cannot be
+             * recycled while inherited pipeline descriptors are still open. */
+            waited=waitpid(pid,&status,WNOHANG);
+            if (waited==pid) {child_owned=false;break;}
+            if (waited<0) {
+                if (errno==EINTR) continue;
+                if (errno==ECHILD) child_owned=false;
+                good=false;error=errno;break;
+            }
+        }
         for(i=0;i<2;i++) if (io[i]>=0) {
             fds[count].fd=io[i];fds[count].events=POLLIN|POLLHUP|POLLERR;fds[count].revents=0;count++;
         }
@@ -5535,8 +5869,12 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
         }
         for(i=0;i<2 && good;i++) {
             unsigned char chunk[4096]; ssize_t n;
+            unsigned reads;
             if (io[i]<0) continue;
-            for (;;) {
+            /* Bound each drain turn. A continuously writable stderr pipe
+             * must not starve stdout, child lifetime checks or signals. */
+            for (reads=0;reads<16;reads++) {
+                if (io_cancelled()) {good=false;error=EINTR;break;}
                 n=read(io[i],chunk,sizeof chunk);
                 if (n<0 && errno==EINTR) continue;
                 if (n<0 && (errno==EAGAIN || errno==EWOULDBLOCK)) break;
@@ -5559,17 +5897,22 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
             }
         }
     }
+    if (good && io_cancelled()) {good=false;error=EINTR;}
     if (good && !process_flush_cr(output,maximum,cr)) {
         good=false;error=errno ? errno : EFBIG;
     }
-    if (!good) {
+    if (!good && child_owned) {
         /* Cancel the entire pipeline before waiting. Do not leave children
          * using pipes after the editor has returned to its command prompt. */
         (void)kill(-pid,SIGKILL);(void)kill(pid,SIGKILL);
     }
     for (i=0;i<2;i++) if (io[i]>=0) close(io[i]);
-    while ((waited=waitpid(pid,&status,0))<0 && errno==EINTR) {}
-    if (waited!=pid) {good=false;error=errno;}
+    /* The only blocking wait is cleanup after SIGKILL, never a normal wait
+     * for an arbitrary shell command whose output pipes happened to close. */
+    if (child_owned) {
+        while ((waited=waitpid(pid,&status,0))<0 && errno==EINTR) {}
+        if (waited!=pid) {good=false;if (!error) error=errno;}
+    }
     if (!good) {
         snprintf(report,report_n,"Command stopped; output discarded (%s).",
                  error==EINTR ? "interrupted" : error==EILSEQ ? "non-text control byte" :
@@ -5583,11 +5926,12 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
         snprintf(report,report_n,"stderr: %.150s",stderr_text);
     } else report[0]=0;
 failed:
-    if (out[0]>=0 && pid<0) close(out[0]);
+    if (out[0]>=0) close(out[0]);
     if (out[1]>=0) close(out[1]);
-    if (err[0]>=0 && pid<0) close(err[0]);
+    if (err[0]>=0) close(err[0]);
     if (err[1]>=0) close(err[1]);
     if (input_file) fclose(input_file);
+    if (child_signals) (void)sigaction(SIGCHLD,&previous_chld,NULL);
     return good && waited==pid && WIFEXITED(status) && WEXITSTATUS(status)==0;
 }
 static bool insert_shell_output(const char *command_line, size_t start, size_t length,
@@ -5602,6 +5946,10 @@ static bool insert_shell_output(const char *command_line, size_t start, size_t l
     maximum=LIMIT-(text.n-length);
     okay=process_capture(command_line,replacing ? text.s+start : NULL,
                          replacing ? length : 0,maximum,&output,report,sizeof report);
+    if (okay && io_cancelled()) {
+        okay=false;
+        snprintf(report,sizeof report,"Command stopped; output discarded (interrupted).");
+    }
     if (okay) {
         if (!replacing && !output.n) tell("Command succeeded with no output. Text unchanged.%s%s",
                                         *report ? " " : "",report);
@@ -5739,10 +6087,12 @@ static bool execute_script_step(const char *source)
     if (!strcmp(verb,"run")) return run_script_file(arg);
     if (!strcmp(verb,"find")) {
         if (!*arg) {tell("Script find requires text.");return false;}
-        start_search(arg);return !io_cancelled();
+        return start_search(arg);
     }
-    if (!strcmp(verb,"next") || !strcmp(verb,"prev"))
-        return !*arg && find_match(!strcmp(verb,"next"),false);
+    if (!strcmp(verb,"next") || !strcmp(verb,"prev")) {
+        if (!blank_tail(arg)) goto usage;
+        return find_match(!strcmp(verb,"next"),false);
+    }
     if (!strcmp(verb,"goto")) {
         if (!positive_number(arg,&rest,&line) || (p=numbered_line(line))==SIZE_MAX)
             goto usage;
@@ -5856,6 +6206,7 @@ static void execute(void)
     const CommandHelp *info;
     const char *canonical;
     size_t count, line, column, p;
+    unsigned expansions = 0;
     const char *rest;
     if (command_n >= sizeof command || command[command_n] != 0) {
         command_set(""); command_mode = true;
@@ -5865,6 +6216,8 @@ static void execute(void)
     while (*verb == ' ' || *verb == '\t') verb++;
     if (*verb && !history_suppress) command_remember(verb);
     history_choice = -1;
+resolve_command:
+    while (*verb == ' ' || *verb == '\t') verb++;
     arg = verb;
     while (*arg && *arg != ' ' && *arg != '\t') arg++;
     if (*arg) { *arg++ = 0; while (*arg == ' ' || *arg == '\t') arg++; }
@@ -5895,9 +6248,20 @@ static void execute(void)
     }
     info = command_lookup(verb);
     if (!info) {
-        if (user_command_index(verb)>=0) {
-            if (*arg) tell("User command %s takes no arguments.",verb);
-            else (void)call_user_command(verb);
+        int index = user_command_index(verb);
+        if (index>=0) {
+            if (*arg) { tell("User command %s takes no arguments.",verb); return; }
+            if (expansions++ >= SCRIPT_DEPTH_MAX) {
+                tell("User command recursion limit (%d).",SCRIPT_DEPTH_MAX); return;
+            }
+            if (io_cancelled()) { tell("User command interrupted."); return; }
+            /* Direct invocation is an alias for typed input, including its
+             * normal prompts and unsaved-work checks. Scripts use their own
+             * restricted dispatcher and cannot escape it through an alias.
+             * Expand locally so history retains the user's original name. */
+            memcpy(parsed,user_commands[index].body,strlen(user_commands[index].body)+1);
+            verb=parsed;
+            goto resolve_command;
         } else command_unknown(verb);
         return;
     }
@@ -5930,7 +6294,7 @@ static void execute(void)
         if (*body) {*body++=0;while (*body==' ' || *body=='\t') body++;}
         if (!*name || !*body) {
             if (!*arg) request_argument("define","NAME command> ");
-            else command_usage(info,"Use define NAME COMMAND; e.g. define files shell ls -1.");
+            else command_usage(info,"Use define NAME COMMAND; e.g. define dirlist shell ls -1.");
         } else (void)change_user_command(name,body);
         return;
     }
@@ -6286,6 +6650,9 @@ static void execute(void)
     else if (!strcmp(canonical, "bind")) {
         char keyname[48]; size_t n=strcspn(arg," \t");
         const char *action=arg+n;
+        if (keys_disabled) {
+            tell("Bindings disabled by --no-keys; restart without it to change bindings."); return;
+        }
         while (*action==' ' || *action=='\t') action++;
         if (!n || n>=sizeof keyname || !*action) {
             tell("Use bind KEY COMMAND. See bindings for key names."); return;
@@ -6295,9 +6662,16 @@ static void execute(void)
             tell("Key/command not supported. See bindings."); return;
         }
         if (save_bindings()) tell("Bound %s to %s.",keyname,action);
-        else tell("Bound for this session; could not save keys.conf.");
+        else if (errno==EAGAIN || errno==EEXIST)
+            tell("Bound for this session; keys.conf changed. Reopen editor before saving bindings.");
+        else if (!bindings_loaded)
+            tell("Bound for this session; keys.conf invalid/unreadable. Repair it and reopen editor.");
+        else tell("Bound for this session; could not save keys.conf: %s.",strerror(errno));
     } else if (!strcmp(canonical, "unbind")) {
         char keyname[24]; int code,i;
+        if (keys_disabled) {
+            tell("Bindings disabled by --no-keys; restart without it to change bindings."); return;
+        }
         if (!*arg || strcspn(arg," \t") != strlen(arg)) {
             tell("Use unbind KEY."); return;
         }
@@ -6306,7 +6680,11 @@ static void execute(void)
         memmove(binds+i,binds+i+1,(bind_count-(size_t)i-1)*sizeof *binds);
         bind_count--;
         if (save_bindings()) tell("Unbound %s.",arg);
-        else tell("Unbound for this session; could not save keys.conf.");
+        else if (errno==EAGAIN || errno==EEXIST)
+            tell("Unbound for this session; keys.conf changed. Reopen editor before saving bindings.");
+        else if (!bindings_loaded)
+            tell("Unbound for this session; keys.conf invalid/unreadable. Repair it and reopen editor.");
+        else tell("Unbound for this session; could not save keys.conf: %s.",strerror(errno));
     }
     else if (!strcmp(canonical, "suspend")) suspended=1;
     else if (!strcmp(canonical, "about")) open_viewer("About",about_text);

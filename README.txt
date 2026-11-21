@@ -1,5 +1,5 @@
 EDITOR(1)
-editor 0.6.13 - a small, dependency-light, full-screen text editor
+editor 0.6.14 - a small, dependency-light, full-screen text editor
 
 NAME
     editor - edit a text file using plain commands or a numbered menu
@@ -18,7 +18,7 @@ fails, so a failed compilation does not install an older local executable.
     install -m 755 editor "$HOME/.local/bin/editor" &&
     "$HOME/.local/bin/editor" --version
 
-For the standalone source download, substitute editor-0.6.13.c for editor.c
+For the standalone source download, substitute editor-0.6.14.c for editor.c
 in the compilation command above.
 
 Repeat this build-and-install sequence after each source update. Compiling
@@ -46,6 +46,16 @@ bare editor command. The explicit path $HOME/.local/bin/editor bypasses that
 name lookup. Other shells may use a different login/startup file. PATH setup
 is only needed once; do not append it again for each editor update.
 
+SYSTEM-WIDE OPENBSD INSTALL (ROOT-OWNED)
+For use from both a personal login and doas -u root -s:
+
+    cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor &&
+    doas install -o root -g wheel -m 755 editor /usr/local/bin/editor &&
+    /usr/local/bin/editor --version
+
+From an existing root shell, omit doas. A separate ~/.local/bin/editor
+copy is not updated by this command; check command -v editor.
+
 RUN
     editor config.conf
     editor --menu config.conf
@@ -69,7 +79,7 @@ EXTERNAL COMMANDS AND USER-DEFINED COMMANDS
     is one undo step. The shell child runs with editor's OS privileges and
     working directory. When editor runs as root, the child also runs as root.
     Shell commands are therefore explicit only: opening a document, pasting,
-    loading a config, and reading a script cannot execute arbitrary text.
+    loading a config, and viewing a script as a document do not execute it.
     No terminal input is provided to shell commands. For filter, stdin is the
     selected document text. stdout is the only text inserted; stderr and exit
     status are kept separate. A nonzero exit, interrupt, allocation failure,
@@ -79,15 +89,25 @@ EXTERNAL COMMANDS AND USER-DEFINED COMMANDS
     Filters may legitimately return empty output and thereby delete text.
     Undo reverses each successful insertion or replacement.
 
-    define files shell ls -1
-        Save a custom editor command named files; type files to run it.
+    define dirlist shell ls -1
+        Save a custom editor command named dirlist; type dirlist to run it.
+
+    define q1 quit!
+        Save q1 as an explicit alias for discarding unsaved edits and exiting.
+        q1 exists only after defining it. Plain quit still checks for changes.
+
+    A directly invoked definition behaves like typing its command, including
+    normal prompts. For example, define store write retains Filename> for an
+    unnamed file. Definitions may call other definitions, up to eight levels.
+    Script calls keep the restricted script rules even through nested aliases.
+    The built-in files name already means ls; dirlist avoids that conflict.
 
     define stamp shell date
         Save a name for a shell-output insertion.
 
     functions
         List the saved definitions. functions reload rereads the file.
-    undefine files
+    undefine dirlist
         Remove a definition.
 
     run ~/commands.editor
@@ -108,12 +128,21 @@ EXTERNAL COMMANDS AND USER-DEFINED COMMANDS
     movement/edit, run, and named custom commands. Other editor commands
     (including quit, read, write, define) are refused within scripts to
     prevent unexpected interactive prompts or document switches. A script
-    stops on failure, after no more than 200 executed steps or 8 nested
+    stops on failure (including a find with no match), after no more than
+    200 executed steps or 8 nested
     definitions/scripts. Earlier successful steps stay in the undo history,
     one entry per edit; a script is NOT an all-or-nothing transaction.
 
-    Optional hotkeys can invoke defined commands: bind F2 files. No default
+    Optional hotkeys can invoke defined commands: bind F2 dirlist. No default
     bindings are added; defining a command never assigns a key.
+
+    Key binding saves detect another session changing keys.conf, including
+    while a save is being staged. A refused save keeps the requested binding
+    in this session and reports that it was not saved. Reopen editor to load
+    the current file before saving more bindings. Malformed keymap content
+    must be corrected first; saving never silently removes unknown entries.
+    --no-keys also disables bind/unbind for that launch, so an unloaded map
+    cannot be overwritten accidentally.
 
     User definitions are stored in $XDG_CONFIG_HOME/editor/commands.conf,
     or ~/.config/editor/commands.conf (not in config or keys.conf). This is
@@ -786,6 +815,13 @@ SAVING AND UNDO
     newline style found in the file, or LF by default. NUL bytes are refused.
 
 PASTING FROM THE TERMINAL
+    An incomplete paste is discarded after five seconds without data. The
+    editor displays a waiting-for-end-marker notice and keeps the document
+    and command draft intact. Delayed paste bytes cannot become commands.
+    If the terminal lost its end marker, make a small fresh bracketed paste
+    to supply one; that paste is discarded too. Then paste the wanted text
+    again. A complete paste still uses one undo step.
+
     Terminal paste recognizes CR, LF and CRLF line breaks and inserts each
     using the document's current newline style (the first newline found
     when opened, or LF for a new file). A CRLF pair produces one line break,
@@ -820,7 +856,7 @@ TERMINAL AND LIMITATIONS
     private plaintext file, not the desktop clipboard.
 
 ABOUT
-    editor 0.6.13
+    editor 0.6.14
     design by remfan1994
     published by ThatIAm.vip
 
@@ -877,8 +913,9 @@ RELIABILITY, FAILURE HANDLING, AND HISTORY ARCHIVES
 
     Failed staged writes and rejected clipboard reads release their resources.
     With signal_controls=on, SIGINT cancels filename entry completely. Cancelled bracketed-paste bytes
-    are discarded through their end marker, with a five-second idle timeout
-    if the marker never arrives. Ordinary unbracketed paste cannot reliably
+    are discarded through their end marker even after an idle timeout. A
+    visible notice appears after five seconds without data; late input remains
+    part of the discarded paste. Ordinary unbracketed paste cannot reliably
     be distinguished from typing. Partial screen output invalidates the cached
     display; the next successful redraw repaints it. Viewer wrapping counts
     display columns, preserving tabs and complete UTF-8 code points.
