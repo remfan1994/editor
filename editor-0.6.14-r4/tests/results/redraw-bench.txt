@@ -1,0 +1,18 @@
+Trial 1 r1
+normal: 15000 redraws, 0.341911 seconds, 405000 realloc calls
+8 MiB single line: 1000 redraws, 0.453673 seconds, 27000 realloc calls
+Trial 1 r2
+normal: 15000 redraws, 0.358391 seconds, 59999 realloc calls
+8 MiB single line: 1000 redraws, 0.357077 seconds, 3999 realloc calls
+Trial 2 r1
+normal: 15000 redraws, 0.340138 seconds, 405000 realloc calls
+8 MiB single line: 1000 redraws, 0.462450 seconds, 27000 realloc calls
+Trial 2 r2
+normal: 15000 redraws, 0.341185 seconds, 59999 realloc calls
+8 MiB single line: 1000 redraws, 0.391184 seconds, 3999 realloc calls
+Trial 3 r1
+normal: 15000 redraws, 0.338153 seconds, 405000 realloc calls
+8 MiB single line: 1000 redraws, 0.457802 seconds, 27000 realloc calls
+Trial 3 r2
+normal: 15000 redraws, 0.334807 seconds, 59999 realloc calls
+8 MiB single line: 1000 redraws, 0.372410 seconds, 3999 realloc calls

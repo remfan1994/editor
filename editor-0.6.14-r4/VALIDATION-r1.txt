@@ -1,0 +1,31 @@
+EDITOR 0.6.14-r1 - VALIDATION
+
+Linux x86_64. Strict C99 builds (-O2 -Wall -Wextra -Werror -pedantic)
+passed on GCC and Clang, both normal and EDITOR_NO_CMD. nm -u on the GCC
+restricted executable found no fork, exec, system, popen, spawn or waitpid
+imports. --version and --manual correctly report no-cmd policy.
+
+Targeted core regression program passed in four compiler/build combinations
+(GCC/Clang x normal/restricted). The same core test passed in Clang ASan
+and UBSan normal and restricted builds, with leak detection enabled.
+Checks cover symbolic ranges, CRLF/LF, undo/redo, invalid ranges, canonical
+name protection, persistent synonym override/undefine, effective alias
+list, scripts, hotkeys, selected clipboard paste, failed read-only clipboard
+cut, read-only document save refusal, normal shell/filter, closed stdin
+child-process regression, and restricted direct/custom/filter/script paths.
+
+Actual PTY tests passed for symbolic line deletion and saving; reading and
+undoing the new journal with the original 0.6.14 executable; persistent
+custom definitions and bindings; blocked direct, custom, saved hotkey and
+script execution in both restricted variants; normal editing/undo while
+restricted; and a literal file named --no-cmd after the -- option delimiter.
+
+Tests use isolated temporary HOME/XDG directories and harmless local marker
+files. To reproduce, use tests/run.sh with a copy of the original commented
+0.6.14 source. Python 3 and pexpect are needed for PTY tests only.
+
+Limits: no native OpenBSD test; no full original regression suite available
+in this working environment; no power-loss, prolonged operation, or broad
+fault-injection testing. The focused tests do not establish that every
+historical defect has been fixed. Original 0.6.14 limitations remain where
+not explicitly addressed. No remote repository was modified.

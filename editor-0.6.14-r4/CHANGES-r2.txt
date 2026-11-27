@@ -1,0 +1,31 @@
+EDITOR 0.6.14-r2 - MAINTENANCE PASS
+November 25, 2026
+
+Base: editor 0.6.14-r1, the selective rollback. No command, option,
+configuration field, file format, dependency, or editing feature was added.
+The original 0.6.14 undo behavior and retained r1 changes remain in place.
+
+FIXES
+- After reading regular files, verify the named path still identifies the
+  version read from the descriptor. Report EISDIR for directories. An
+  observed replacement during read is now rejected; reading another file
+  preserves the existing document on failure.
+- Verify the named undo journal still identifies the opened version after
+  reading. On detected replacement, retain the document and reject the
+  journal, without rewriting it. Journal formats and existing limits remain.
+- Preserve a resize signal arriving during the terminal-size query and
+  immediately loop to handle flags pending after drawing. This fixes the
+  observed lost-resize flag, not every possible signal/I/O interleaving.
+- Accept harmless trailing spaces/tabs in undefine NAME, matching the
+  command's existing argument-validation policy.
+
+PERFORMANCE
+- Compare a rendered row against the existing cache before allocating a
+  replacement row; identical rows do not allocate or emit terminal bytes.
+- Reuse the line end already determined when drawing each row, rather than
+  scanning the same line again for horizontal position or the next row.
+  These use the existing screen and layout caches, not a new subsystem.
+
+No future-proofing, environment classification, plain rescue mode, emergency
+recovery, history archive browser, or later history architecture was restored.
+No liner changes. See ROLLBACK-r1.txt for the earlier selective rollback.

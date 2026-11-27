@@ -1,0 +1,17 @@
+EDITOR 0.6.14-r4 - SOFT WORD WRAPPING
+Base: exact editor-0.6.14-r3 source archive.
+
+- Default-on display-only word wrapping at the terminal width. Whitespace
+  and source bytes are retained; long words can split between decoded units.
+- toggle-wrap switches and persists the preference through the existing
+  atomic preference writer. Help and Help > Settings show the live value.
+- --wrap and --no-wrap override the preference for one invocation; --no-wrap
+  retains the original horizontal scrolling view.
+- settings show, list, help toggle-wrap, and --help/--manual document it.
+- Vertical movement, paging, mouse placement and viewport scrolling follow
+  visible rows in wrap mode. File line numbering, Home/End, goto and editing
+  commands continue to use logical lines.
+- Width-sensitive display checkpoints are bounded and invalidated on edits,
+  undo/redo, document switches and resize; they are not saved or journaled.
+- No changes to storage, line endings, undo format, command-execution policy,
+  or existing editor features beyond this display option.

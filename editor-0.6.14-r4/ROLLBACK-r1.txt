@@ -1,0 +1,51 @@
+EDITOR 0.6.14-r1 - SELECTIVE ROLLBACK
+November 25, 2026
+
+BASELINE
+Original commented 0.6.14: 7,558 lines, 338,727 bytes.
+Final 0.7.5 before rollback: 8,707 lines, 391,948 bytes.
+This rollback is built from the actual 0.6.14 file, not from a stripped-down
+copy of 0.7.5. Existing 0.6.14 undo, persistent undo, save, clipboard, file,
+menu, terminal and script behaviors are the starting point.
+
+RETAINED USER FEATURES
+- define can claim a factory synonym. Canonical command names remain
+  reserved. Claimed synonyms are hidden from the effective synonym list,
+  help lookup and completion; the user definition takes precedence.
+  undefine restores the built-in synonym. Existing factory punctuation
+  synonyms can also be claimed. Bindings invoke the same command resolver.
+- Symbolic line endpoints for dline, copy, cut, filter-lines, and goto
+  (including script goto/filter-lines); standalone bof/eof navigation.
+  top/start/first/bof and bottom/end/last/eof work as line addresses.
+  A final newline's empty screen row retains the 0.6.14 meaning.
+- --no-cmd and -DEDITOR_NO_CMD. The restriction applies to direct commands,
+  aliases, saved hotkeys, user commands, scripts, filters, and menu paths.
+  Internal editor commands continue to work. The no-cmd binary has no
+  process-creation/execution code. No OS sandbox is implied.
+
+RETAINED FOCUSED FIXES
+- Avoid unnecessary doubling at the existing 8 MiB buffer boundary.
+- Detect a changed pathname after reading; correct directory error reporting.
+- Refuse actual document replacement if a destination is read-only or
+  cannot be opened for writing; do not truncate it for the permission test.
+- Preserve private clipboard ownership/mode checks and validate observed
+  state when updating a slot; refuse unsafe/read-only targets. A cut does
+  not remove document text if the clipboard write fails or is uncertain.
+- Propagate private-state publication warnings; preserve selected-slot paste.
+- Correct child descriptor setup when standard descriptors were closed.
+- Correct the user-command heading in a filtered command listing.
+
+NOT CARRIED FORWARD
+- Plain/rescue mode and --check environmental classification.
+- Abnormal-exit recovery files and --recoveries.
+- Post-0.6.14 history locking, mandatory prospective journal commits,
+  journal/parser refactoring and history archives/view/restore commands.
+- Post-0.6.14 menu command and Settings Apply/Return change: not confirmed
+  as specifically requested. Existing 0.6.14 settings/menu remain.
+- No new classification framework, persistence subsystem or compatibility
+  architecture. No changes to liner.
+
+The small private-state publication fixes above are retained to fix actual
+clipboard/read-only target behavior, not to introduce another history
+system. Older 0.6.14 journal/clipboard behavior remains, including the
+baseline's best-effort undo journal and ordinary save limitations.

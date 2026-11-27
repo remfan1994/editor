@@ -1,0 +1,40 @@
+EDITOR 0.6.14-r3 - VALIDATION
+
+Linux x86_64; GCC 14.2.0 and Clang 17.0.0. Both normal and
+EDITOR_NO_CMD binaries compiled with -std=c99 -O2 -Wall -Wextra -Werror
+-pedantic on both compilers. New tests/interim-core.c passes eight groups
+per build on GCC and Clang, and per build with Clang ASan+UBSan, leak
+checking and UBSan halt_on_error. Test-only wrappers inject syscall faults;
+no hooks or new runtime dependencies are included in editor.c.
+
+Groups:
+- ENOSPC while syncing a staged journal leaves old bytes and live undo.
+- Directory fsync failure after a document save leaves the document saved,
+  reports an undo persistence warning, and retains history for retry.
+- Journal replacement during directory synchronization is detected.
+- Permission change immediately after publication is detected.
+- Invalid redo offset in a checksummed journal is rejected before rebase.
+- Valid redo reopening and external-content rebase still undo/redo.
+- Existing 100,000-transaction journal limit reports the correct cause.
+- Read-only replacement is refused before an overwrite prompt.
+The new suite fails on unmodified r2 at the post-commit directory sync
+failure assertion. This is an expected regression-reproduction failure.
+
+Inherited tests/run.sh and tests/run-stability.sh passed on final r3;
+these include both build variants, original 0.6.14 journal compatibility,
+actual terminal restrictions, symbolic editing, custom commands, clipboard,
+read-only protection, pathname races, resize, row rendering, and 12,000
+seeded mixed-byte edits per build with undo/redo and independent model.
+Restricted binary process-execution import check passed in run-stability.sh.
+Earlier performance measurements and historical tests remain historical;
+no new performance claims, full original regression-suite certification,
+native OpenBSD run, or actual power-loss tests in this pass.
+
+Reproduce:
+  tests/run-interim.sh
+  CC=clang tests/run-interim.sh
+  CC=clang CFLAGS='-std=c99 -g -O1 -Wall -Wextra -Werror -pedantic -fsanitize=address,undefined -fno-omit-frame-pointer' ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 tests/run-interim.sh
+  tests/run.sh /path/to/commented-editor-0.6.14.c
+  tests/run-stability.sh
+Logs for this pass: tests/results/r3/. Historical logs outside r3/ refer
+only to earlier revisions. No full original historical suite available.

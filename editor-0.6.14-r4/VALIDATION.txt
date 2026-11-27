@@ -1,0 +1,19 @@
+EDITOR 0.6.14-r4 - VALIDATION
+
+Linux x86_64; strict C99 builds with -O2 -Wall -Wextra -Werror -pedantic.
+Normal and EDITOR_NO_CMD builds pass tests/run-wrap.sh. Focused tests
+exercise word boundaries, CRLF, blank and EOF rows, long words, tabs,
+visible escapes, malformed bytes, wide UTF-8, visual cursor movement,
+logical line numbers, resize, mouse placement, sparse-cache invalidation,
+undo/redo, both menu toggle paths, settings reporting and persistence.
+Actual PTY tests verify default-on wrapping, live toggling, saved settings,
+startup override behavior, resize and byte-identical write to a new file.
+Inherited tests/run-stability.sh and tests/run-interim.sh also passed in
+both build variants, including 12,000 deterministic mixed-byte edits per
+build, filesystem race checks, and undo persistence fault injection.
+Detailed logs are in tests/results/r4/.
+
+Limitations: Tested in Linux PTYs, not on physical ChromeOS or OpenBSD
+hardware. No claim of exhaustive testing or a full 1.0 certification.
+The source baseline was the available exact r3 archive; the user's locally
+installed executable was not inspected. Earlier reports are historical.

@@ -1,0 +1,4 @@
+editor 0.6.14-r2
+editor 0.6.14-r2 (no-cmd build)
+editor 0.6.14-r2
+editor 0.6.14-r2 (no-cmd build)

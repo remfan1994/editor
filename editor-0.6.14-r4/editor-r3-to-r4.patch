@@ -1,0 +1,632 @@
+--- editor.c
++++ editor.c
+@@ -1,5 +1,5 @@
+ /*
+- * editor 0.6.14-r3 - a small, single-file terminal text editor.
++ * editor 0.6.14-r4 - a small, single-file terminal text editor.
+  * Build: cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor
+  * Run:   ./editor [FILE]
+  *
+@@ -13,7 +13,7 @@
+  * About/manual are read-only pages; q or Esc returns to editing.
+  *
+  * Uses libc and Unix terminal interfaces, without curses or terminfo.
+- * One file, horizontal scrolling, up to 8 MiB. Optional user key bindings.
++ * One file, soft word wrapping or horizontal scrolling, up to 8 MiB. Optional user key bindings.
+  * Existing bytes and line endings are preserved; Enter uses the first
+  * newline style in the file. Terminal paste converts CR/LF/CRLF to that
+  * style; file-backed clipboard commands keep their bytes. New files use LF.
+@@ -79,7 +79,7 @@
+ #define LIMIT ((size_t)8 * 1024 * 1024)
+ #define COMMAND_SIZE 4096
+ #define CONFIG_LIMIT ((size_t)32768)
+-#define VERSION "0.6.14-r3"
++#define VERSION "0.6.14-r4"
+ /* An immutable build policy, or a one-way launch policy. No setting,
+  * command, script or environment variable can turn shell execution back on. */
+ #ifdef EDITOR_NO_CMD
+@@ -134,9 +134,9 @@
+ 
+ static const char manual_text[] =
+     "EDITOR MANUAL\n"
+-    "editor 0.6.14-r3\n"
++    "editor 0.6.14-r4\n"
+     "\n"
+-    "RUN: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n"
++    "RUN: editor [--menu|--cli] [--mouse|--no-mouse] [--wrap|--no-wrap] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n"
+     "\n"
+     "EDIT MODE (default): Type text. Arrows, Home/End and PgUp/PgDn move.\n"
+     "  Backspace/Delete erase. Enter inserts newline; Tab inserts tab.\n"
+@@ -193,6 +193,9 @@
+     "  settings           Open Help > Settings.\n"
+     "  toggle-startup     Switch and save startup: Edit / Movement.\n"
+     "  toggle-mouse       Switch and save optional mouse input.\n"
++    "  toggle-wrap        Switch and save word wrap (default ON; display only).\n"
++    "    --wrap/--no-wrap override one launch. Up/Down follow visual rows.\n"
++    "    Home/End and line commands use logical file lines.\n"
+     "  toggle-signals     Switch and save signal handling (default OFF).\n"
+     "  toggle-cliphistory Switch and save clipboard history (default OFF).\n"
+     "  settings show      Inspect current/saved values and config path.\n"
+@@ -303,6 +306,7 @@
+ static bool startup_config_warning;
+ /* Saved startup preference is independent of the current document mode. */
+ static bool startup_movement, startup_esc_menu, startup_signals, startup_mouse;
++static bool wrap_enabled, startup_wrap = true;
+ static bool startup_sync_warning;
+ static int startup_config_error;
+ /* OFF leaves interrupt/stop to terminal job control. ON opts into the
+@@ -417,7 +421,7 @@
+     "  movement / edit changes only this session's text-entry mode.\n"
+     "  toggle-esc switches the ONE saved Esc choice: Menu or Command line.\n"
+     "  toggle-signals switches and saves interrupt behavior; OFF is the default.\n"
+-    "  toggle-mouse and toggle-cliphistory also switch and save their choices.\n"
++    "  toggle-mouse, toggle-wrap and toggle-cliphistory switch and save their choices.\n"
+     "  Each toggle takes NO arguments. settings show gives current/saved values and path.\n\n"
+     "EXTENDING EDITOR\n"
+     "  shell COMMAND inserts stdout at cursor; shell alone asks for command.\n"
+@@ -715,9 +719,23 @@
+ static LayoutPoint layout_points[LIMIT / LAYOUT_STEP + 1];
+ static size_t layout_count;
+ static LayoutPoint layout_recent;
++/* Display-only row starts. Sparse checkpoints bound rescanning without
++ * indexing every wrapped row. No document or journal format is changed. */
++static size_t wrap_points[LIMIT / LAYOUT_STEP + 1];
++static size_t wrap_count, wrap_recent, wrap_width;
++static void wrap_invalidate(size_t at)
++{
++    /* A row can look ahead at most width+1 UTF-8 units before deciding
++     * its word break. Include CRLF and malformed UTF-8 overlap. */
++    size_t margin = 4 * (wrap_width + 1) + 4;
++    size_t safe = at > margin ? at - margin : 0;
++    while (wrap_count > 1 && wrap_points[wrap_count-1] > safe) wrap_count--;
++    if (wrap_recent > safe) wrap_recent = wrap_count ? wrap_points[wrap_count-1] : 0;
++}
+ 
+ static void layout_reset(void)
+ {
++    wrap_count=0; wrap_recent=0;
+     layout_count=1;
+     layout_points[0]=(LayoutPoint){0,1,0,0};
+     layout_recent=layout_points[0];
+@@ -728,6 +746,7 @@
+     /* A byte edit can complete a formerly invalid UTF-8 sequence or CRLF
+      * starting just before it. Keep only checkpoints before that overlap. */
+     size_t safe=at>3 ? at-3 : 0;
++    wrap_invalidate(at);
+     if (!layout_count) layout_reset();
+     while (layout_count>1 && layout_points[layout_count-1].byte>safe)
+         layout_count--;
+@@ -852,6 +871,95 @@
+     return position_in_line(start, line_end(start), column);
+ }
+ 
++/* A visual row uses its own tab stops. Whitespace is retained, including
++ * the space at a word break. Long words split only between decoded units.
++ * SIZE_MAX denotes the last row; an ending LF creates an empty EOF row. */
++typedef struct { size_t end, next; } WrapRow;
++static size_t current_wrap_width(void)
++{
++    return cols > 1 ? (size_t)(cols-1) : 1;
++}
++static size_t newline_bytes(size_t p)
++{
++    if (p >= text.n) return 0;
++    if (text.s[p]=='\n') return 1;
++    return text.s[p]=='\r' && p+1<text.n && text.s[p+1]=='\n' ? 2 : 0;
++}
++static WrapRow wrap_row(size_t start)
++{
++    size_t p=start, x=0, split=start, n, nl, width=current_wrap_width();
++    char rep[32]; int cells; bool wide;
++    while (p<text.n && !newline_bytes(p)) {
++        n=representation(text.s,text.n,p,x,rep,&cells,&wide);
++        if ((size_t)cells>width-x) {
++            if (p==start) { /* undersized window still makes progress */
++                p+=n; nl=newline_bytes(p);
++                return (WrapRow){p,nl ? p+nl : p==text.n ? SIZE_MAX : p};
++            }
++            else if (split>start) p=split;
++            return (WrapRow){p, p==text.n ? SIZE_MAX : p};
++        }
++        if (text.s[p]==' ' || text.s[p]=='\t') split=p+n;
++        p+=n; x+=(size_t)cells;
++    }
++    nl=newline_bytes(p);
++    return (WrapRow){p,nl ? p+nl : SIZE_MAX};
++}
++static size_t wrap_at(size_t target)
++{
++    size_t lo=0, hi, mid, p;
++    WrapRow row;
++    if (target>text.n) target=text.n;
++    if (!wrap_count || wrap_width!=current_wrap_width()) {
++        if (wrap_width!=current_wrap_width()) goal_set=false;
++        wrap_width=current_wrap_width(); wrap_count=1;
++        wrap_points[0]=wrap_recent=0;
++    }
++    hi=wrap_count;
++    while (lo+1<hi) {
++        mid=lo+(hi-lo)/2;
++        if (wrap_points[mid]<=target) lo=mid; else hi=mid;
++    }
++    p=wrap_points[lo];
++    if (wrap_recent>p && wrap_recent<=target) p=wrap_recent;
++    for (;;) {
++        if (p>=wrap_points[wrap_count-1]+LAYOUT_STEP &&
++            wrap_count<sizeof wrap_points/sizeof *wrap_points)
++            wrap_points[wrap_count++]=p;
++        row=wrap_row(p);
++        if (row.next==SIZE_MAX || row.next>target) break;
++        p=row.next;
++    }
++    wrap_recent=p; return p;
++}
++static size_t wrap_column(size_t start, size_t p)
++{
++    size_t x=0; char rep[32]; int cells; bool wide;
++    while (start<p) {
++        start+=representation(text.s,p,start,x,rep,&cells,&wide);
++        x+=(size_t)cells;
++    }
++    return x;
++}
++static size_t wrap_position(size_t start, size_t column)
++{
++    WrapRow row=wrap_row(start);
++    size_t x=0,n; char rep[32]; int cells; bool wide;
++    while (start<row.end) {
++        n=representation(text.s,row.end,start,x,rep,&cells,&wide);
++        if (x+(size_t)cells>column) break;
++        x+=(size_t)cells; start+=n;
++    }
++    /* A soft boundary belongs to the next row, not the current one. */
++    if (start==row.end && row.next==row.end)
++        start=prev_pos(text.s,text.n,start);
++    return start;
++}
++static size_t display_start(size_t p)
++{
++    return wrap_enabled ? wrap_at(p) : line_start(p);
++}
++
+ /* Search only the candidate start positions in [first, limit). A forward
+  * search stops at its first match; a backward search retains the last one.
+  * KMP still handles repetitive/overlapping text in linear time. Restricting
+@@ -1102,7 +1210,7 @@
+     journal_dirty = true;
+     search_mark = SIZE_MAX;
+     group = typing; goal_set = false; message[0] = 0;
+-    top = line_start(top > text.n ? text.n : top);
++    top = display_start(top > text.n ? text.n : top);
+     return true;
+ memory_error:
+     tell("Not enough memory. Text unchanged."); return false;
+@@ -1139,7 +1247,7 @@
+     search_mark = SIZE_MAX;
+     current = redo ? p : p->prev;
+     journal_dirty = true;
+-    top = line_start(top > text.n ? text.n : top);
++    top = display_start(top > text.n ? text.n : top);
+     return true;
+ }
+ 
+@@ -1906,6 +2014,12 @@
+      "  Switch mouse input and remember the result.\n"
+      "toggle-mouse\n"
+      "  Switch back. Off leaves ordinary selection to your terminal."},
++    {"toggle-wrap", "", "toggle-wrap",
++     "Switch and save display-only word wrap (default On). --wrap/--no-wrap override one launch. "
++     "No file bytes, line numbers or undo history change. No arguments.",
++     6, "Switch between word wrap and horizontal scrolling.",
++     "toggle-wrap\n  Switch word wrap On/Off and save the preference.\n"
++     "  Also available in Help and Help > Settings. Up/Down follow visual rows."},
+     {"toggle-signals", "toggle-signal-controls", "toggle-signals",
+      "Switch and save interrupt handling. OFF (default): terminal interrupt exits without "
+      "saving. ON: interrupt cancels pending input. Stop always suspends. No key is bound and "
+@@ -1931,7 +2045,7 @@
+     {"settings", "options, preferences", "settings [show]",
+      "Open Help > Settings, or use settings show to inspect current/saved values and config "
+      "path. Each switch is one row with its current value. Selecting it runs the matching "
+-     "toggle-* command and saves. Startup affects the next launch; Esc, mouse, signals and "
++     "toggle-* command and saves. Startup affects the next launch; Esc, mouse, wrap, signals and "
+      "clipboard history apply now. Failed saves leave behavior unchanged. No default command "
+      "hotkeys.",
+      6, "Inspect or change saved preferences in Help > Settings.",
+@@ -1945,6 +2059,7 @@
+      "  Switch Command line / Menu for Esc now and next launch.\n"
+      "toggle-mouse\n"
+      "  Switch mouse Off / On now and next launch.\n"
++     "toggle-wrap\n  Switch display-only word wrapping now and next launch.\n"
+      "toggle-signals\n"
+      "  Switch interrupt Exits / Cancels; Ctrl+Z always suspends.\n"
+      "toggle-cliphistory\n"
+@@ -2631,7 +2746,7 @@
+ }
+ 
+ typedef struct { const char *key, *value; size_t key_n, value_n; } ConfigField;
+-typedef struct { bool movement, signals, esc_menu, mouse, warning; } ConfigSettings;
++typedef struct { bool movement, signals, esc_menu, mouse, wrap, warning; } ConfigSettings;
+ /* Slice a line without changing its bytes. The writer can preserve comments,
+  * spacing, unknown settings and LF/CRLF while replacing just the value. */
+ static ConfigField config_field(const char *s, size_t n)
+@@ -2662,7 +2777,7 @@
+  * the text, which save_preference() needs to preserve unrelated entries. */
+ static ConfigSettings parse_config(const Buffer *b)
+ {
+-    ConfigSettings settings={0};
++    ConfigSettings settings={.wrap=true};
+     size_t at=0;
+     while (at<b->n) {
+         const char *line=b->s+at, *lf=memchr(line,'\n',b->n-at);
+@@ -2679,6 +2794,8 @@
+             else if (config_word(f.key,f.key_n,"esc") && config_word(f.value,f.value_n,"cli")) settings.esc_menu=false;
+             else if (config_word(f.key,f.key_n,"mouse") && config_word(f.value,f.value_n,"on")) settings.mouse=true;
+             else if (config_word(f.key,f.key_n,"mouse") && config_word(f.value,f.value_n,"off")) settings.mouse=false;
++            else if (config_word(f.key,f.key_n,"wrap") && config_word(f.value,f.value_n,"on")) settings.wrap=true;
++            else if (config_word(f.key,f.key_n,"wrap") && config_word(f.value,f.value_n,"off")) settings.wrap=false;
+             else settings.warning=true;
+         }
+         at+=n;
+@@ -2688,7 +2805,7 @@
+ static ConfigSettings startup_settings(void)
+ {
+     Buffer b={0};
+-    ConfigSettings settings={0};
++    ConfigSettings settings={.wrap=true};
+     int result=read_config("config",&b);
+     startup_config_error=result<0 ? errno : 0;
+     if (result==1) settings=parse_config(&b);
+@@ -2698,6 +2815,7 @@
+         startup_esc_menu=settings.esc_menu;
+         startup_signals=settings.signals;
+         startup_mouse=settings.mouse;
++        startup_wrap=settings.wrap;
+     }
+     free(b.s); return settings;
+ }
+@@ -2708,6 +2826,7 @@
+     signal_controls=settings.signals;
+     menu_preferred=settings.esc_menu;
+     mouse_enabled=settings.mouse;
++    wrap_enabled=settings.wrap;
+ }
+ static bool config_append(Buffer *b, const char *s, size_t n)
+ {
+@@ -2717,7 +2836,7 @@
+     b->n+=n; b->s[b->n]=0; return true;
+ }
+ enum { SETTING_STARTUP, SETTING_ESC, SETTING_SIGNALS, SETTING_MOUSE,
+-       SETTING_CLIPHISTORY, SETTING_COUNT };
++       SETTING_CLIPHISTORY, SETTING_WRAP, SETTING_COUNT };
+ /* One registry identifies every persistent switch. Menus use the same
+  * commands as typed input; toggles never accept an on/off sub-language. */
+ typedef struct {
+@@ -2728,7 +2847,8 @@
+     { "toggle-esc", "Esc", "esc", "menu", "cli" },
+     { "toggle-signals", "Signal handling", "signal_controls", "on", "off" },
+     { "toggle-mouse", "Mouse", "mouse", "on", "off" },
+-    { "toggle-cliphistory", "Clipboard history", NULL, "on", "off" }
++    { "toggle-cliphistory", "Clipboard history", NULL, "on", "off" },
++    { "toggle-wrap", "Word wrap", "wrap", "on", "off" }
+ };
+ static int setting_toggle_index(const char *command_name)
+ {
+@@ -2744,6 +2864,7 @@
+     case SETTING_ESC: return menu_preferred;
+     case SETTING_SIGNALS: return signal_controls!=0;
+     case SETTING_MOUSE: return mouse_enabled;
++    case SETTING_WRAP: return wrap_enabled;
+     case SETTING_CLIPHISTORY: return clip_history_enabled;
+     default: return false;
+     }
+@@ -2778,7 +2899,8 @@
+     settings=parse_config(&old);
+     previous=kind==SETTING_STARTUP ? settings.movement :
+              kind==SETTING_ESC ? settings.esc_menu :
+-             kind==SETTING_SIGNALS ? settings.signals : settings.mouse;
++             kind==SETTING_SIGNALS ? settings.signals :
++             kind==SETTING_WRAP ? settings.wrap : settings.mouse;
+     mode=choice<0 ? !previous : choice!=0;
+     value=mode ? on : off;
+     while (at<old.n) {
+@@ -2839,6 +2961,7 @@
+     startup_esc_menu=settings.esc_menu;
+     startup_signals=settings.signals;
+     startup_mouse=settings.mouse;
++    startup_wrap=settings.wrap;
+     startup_config_warning=settings.warning;
+     startup_config_error=0;
+ done:
+@@ -2863,28 +2986,29 @@
+     if (startup_config_error)
+         guide_append(&used,"Cannot read saved settings: %s.\nUse a directory owned by you, not writable by other users.\n\n",
+                      strerror(startup_config_error));
+-    else guide_append(&used,"Saved startup: %s\nSaved Esc interface: %s\nSaved signal handling: %s\nSaved mouse: %s\n\n",
++    else guide_append(&used,"Saved startup: %s\nSaved Esc interface: %s\nSaved signal handling: %s\nSaved mouse: %s\nSaved word wrap: %s\n\n",
+                       startup_movement ? "movement" : "edit",
+                       startup_esc_menu ? "Menu" : "Command line",
+                       startup_signals ? "ON (interrupt cancels)" : "OFF (interrupt exits)",
+-                      startup_mouse ? "On" : "Off");
+-    guide_append(&used,"Current mode: %s\nCurrent Esc interface: %s\nCurrent signal handling: %s\nCurrent mouse: %s\nClipboard history: %s\n\n"
++                      startup_mouse ? "On" : "Off", startup_wrap ? "On" : "Off");
++    guide_append(&used,"Current mode: %s\nCurrent Esc interface: %s\nCurrent signal handling: %s\nCurrent mouse: %s\nCurrent word wrap: %s\nClipboard history: %s\n\n"
+                  "Every toggle switches one choice and saves it. No arguments.\n"
+                  "toggle-startup      Next launch: Edit / Movement.\n"
+                  "toggle-esc          Esc opens: Command line / Menu.\n"
+                  "toggle-mouse        Mouse: Off / On.\n"
++                 "toggle-wrap         Word wrap: On / Off (display only).\n"
+                  "toggle-signals      Interrupt: exits / cancels input.\n"
+                  "toggle-cliphistory  Keep clipboard history: Off / On.\n\n"
+                  "Only toggle-startup waits for the next launch. The others apply now.\n"
+                  "movement / edit changes the CURRENT mode, without saving.\n"
+-                 "--movement/--edit, --menu/--cli and --mouse/--no-mouse override one launch.\n"
++                 "--movement/--edit, --menu/--cli, --mouse/--no-mouse and --wrap/--no-wrap override one launch.\n"
+                  "Clipboard history is saved with clipboard data; existing snapshots remain when off.\n"
+                  "Ctrl+C/Z are never bound. With signals off, Ctrl+C exits WITHOUT SAVING.\n"
+                  "Ctrl+Z suspends either way.\n"
+                  "settings opens Help > Settings. Esc/q returns to Command>.\n",
+                  movement_mode ? "movement" : "edit", menu_preferred ? "Menu" : "Command line",
+                  signal_controls ? "ON (interrupt cancels)" : "OFF (interrupt exits)",
+-                 mouse_enabled ? "On" : "Off",clip_history_enabled ? "On" : "Off");
++                 mouse_enabled ? "On" : "Off",wrap_enabled ? "On" : "Off",clip_history_enabled ? "On" : "Off");
+     if (startup_config_warning && !startup_config_error)
+         guide_append(&used,"\nSome unrecognized/invalid config entries were ignored.\n");
+     free(path); guide_open("Settings",command_page,false);
+@@ -4041,7 +4165,8 @@
+     ITEM("User commands", "functions"),
+     ASK("Define command...", "define", "NAME command> "),
+     ASK("Remove command...", "undefine", "User name> "),
+-    ASK("Run script...", "run", "Script file> ")
++    ASK("Run script...", "run", "Script file> "),
++    ITEM("Word wrap", "toggle-wrap")
+ };
+ static const MenuItem menu_settings_items[] = {
+     ITEM("Start in", "toggle-startup"),
+@@ -4049,6 +4174,7 @@
+     ITEM("Mouse", "toggle-mouse"),
+     ITEM("Signal handling", "toggle-signals"),
+     ITEM("Clipboard history", "toggle-cliphistory"),
++    ITEM("Word wrap", "toggle-wrap"),
+     GROUP("User hotkeys >", MENU_KEYS),
+     ITEM("Settings explained", "help settings"),
+     ITEM("Current / saved settings", "settings show")
+@@ -4160,6 +4286,9 @@
+         else if (entries[i].command && !strcmp(entries[i].command, "toggle-mouse"))
+             name = cols<27 ? (mouse_enabled ? "Mouse On" : "Mouse Off") :
+                    (mouse_enabled ? "Mouse: On" : "Mouse: Off");
++        else if (entries[i].command && !strcmp(entries[i].command, "toggle-wrap"))
++            name = cols<27 ? (wrap_enabled ? "Wrap On" : "Wrap Off") :
++                   (wrap_enabled ? "Word wrap: On" : "Word wrap: Off");
+         else if (entries[i].command && !strcmp(entries[i].command, "toggle-signals"))
+             name = cols<27 ? (signal_controls ? "Sig:On" : "Sig:Off") :
+                    (signal_controls ? "Signals: On (cancel)" : "Signals: Off (exit)");
+@@ -4226,7 +4355,7 @@
+         else if (menu_number>=0) {
+             snprintf(info,sizeof info,"Choice %d: Enter",menu_number);
+             hint=info;
+-        } else if (menu_page==MENU_SETTINGS && menu_selection<5)
++        } else if (menu_page==MENU_SETTINGS && menu_selection<6)
+             hint=cols<27 ? "Enter: toggle & save" : "Enter toggles and saves | h/Esc back";
+         else if (editing_clipboard) hint="Write saves | clipboard returns";
+         else hint=cols<27 ? "j/k l h" : "j/k move | l/Enter select | h/Esc back";
+@@ -4235,47 +4364,86 @@
+         output(&out,"\033[?25l");
+         goto finish;
+     }
+-    start = line_start(cursor);
+-    if (top > start) top = start;
+-    p = top;
+-    for (r = 0; r < body && p < start; r++) p = next_line(p);
+-    if (r >= body) {
+-        top = start;
+-        for (r = 1; r < body && top; r++) top = line_start(top - 1);
+-    }
+-    col = column_at(start, cursor);
+-    if (col < left) left = col;
+-    if (col >= left + (size_t)(cols - 1)) left = col - (size_t)(cols - 2);
+-    p = top;
+-    for (r = 0; r < body; r++) {
+-        size_t screen_p,screen_x;
+-        if (p == start) cursor_row = r;
+-        end = line_end(p);
+-        screen_p=p;screen_x=0;
+-        if (left) {
+-            screen_p=position_in_line(p,end,left);
+-            screen_x=column_at(p,screen_p);
+-        }
+-        if (search_mark!=SIZE_MAX && search_length && search_mark>=p &&
+-            search_mark<end && search_length<=text.n-search_mark &&
+-            !memcmp(text.s+search_mark,search_pattern,search_length))
+-            visible_match(&line,text.s+p,end-p,left,(size_t)(cols-1),
+-                          search_mark-p,search_mark-p+search_length,
+-                          screen_p-p,screen_x);
+-        else visible_from(&line,text.s ? text.s+p : "",end-p,left,
+-                          (size_t)(cols-1),screen_p-p,screen_x);
+-        draw_row(&out, r, &line, false);
+-        if (end < text.n) p = end + (text.s[end] == '\r' ? 2 : 1);
+-        else {
+-            r++;
+-            for (; r < body; r++) { line.n = 0; draw_row(&out, r, &line, false); }
+-            break;
++    if (wrap_enabled) {
++        WrapRow row;
++        size_t match_end;
++        width=current_wrap_width();
++        start=wrap_at(cursor); top=wrap_at(top); left=0;
++        if (top>start) top=start;
++        p=top;
++        for (r=0;r<body && p<start;r++) {
++            row=wrap_row(p);
++            if (row.next==SIZE_MAX) break;
++            p=row.next;
++        }
++        if (r>=body) {
++            top=start;
++            for (r=1;r<body && top;r++) top=wrap_at(top-1);
++        }
++        col=wrap_column(start,cursor);
++        if (col>width) col=width;
++        p=top;
++        for (r=0;r<body;r++) {
++            row=wrap_row(p);
++            if (p==start) cursor_row=r;
++            match_end=search_mark<=text.n && search_length<=text.n-search_mark ?
++                      search_mark+search_length : 0;
++            if (match_end>p && search_mark<row.end && search_length &&
++                !memcmp(text.s+search_mark,search_pattern,search_length))
++                visible_match(&line,text.s+p,row.end-p,0,width,
++                              search_mark>p ? search_mark-p : 0,match_end-p,0,0);
++            else visible(&line,text.s ? text.s+p : "",row.end-p,0,width);
++            draw_row(&out,r,&line,false);
++            if (row.next==SIZE_MAX) {
++                for (++r;r<body;r++) {line.n=0;draw_row(&out,r,&line,false);}
++                break;
++            }
++            p=row.next;
++        }
++    } else {
++        start = line_start(cursor);
++        top = line_start(top);
++        if (top > start) top = start;
++        p = top;
++        for (r = 0; r < body && p < start; r++) p = next_line(p);
++        if (r >= body) {
++            top = start;
++            for (r = 1; r < body && top; r++) top = line_start(top - 1);
++        }
++        col = column_at(start, cursor);
++        if (col < left) left = col;
++        if (col >= left + (size_t)(cols - 1)) left = col - (size_t)(cols - 2);
++        p = top;
++        for (r = 0; r < body; r++) {
++            size_t screen_p,screen_x;
++            if (p == start) cursor_row = r;
++            end = line_end(p);
++            screen_p=p;screen_x=0;
++            if (left) {
++                screen_p=position_in_line(p,end,left);
++                screen_x=column_at(p,screen_p);
++            }
++            if (search_mark!=SIZE_MAX && search_length && search_mark>=p &&
++                search_mark<end && search_length<=text.n-search_mark &&
++                !memcmp(text.s+search_mark,search_pattern,search_length))
++                visible_match(&line,text.s+p,end-p,left,(size_t)(cols-1),
++                              search_mark-p,search_mark-p+search_length,
++                              screen_p-p,screen_x);
++            else visible_from(&line,text.s ? text.s+p : "",end-p,left,
++                              (size_t)(cols-1),screen_p-p,screen_x);
++            draw_row(&out, r, &line, false);
++            if (end < text.n) p = end + (text.s[end] == '\r' ? 2 : 1);
++            else {
++                r++;
++                for (; r < body; r++) { line.n = 0; draw_row(&out, r, &line, false); }
++                break;
++            }
+         }
+     }
+     line_number=layout_at(cursor).line;
+     dirty = changed(); width = (size_t)(cols - 1);
+     name = filename ? strrchr(filename, '/') + 1 : "[new file]";
+-    snprintf(info, sizeof info, "%zu:%zu | ", line_number, col + 1);
++    snprintf(info, sizeof info, "%zu:%zu | ", line_number, layout_at(cursor).column + 1);
+     /* Reserve room for the filename and the unsaved marker even in a
+      * narrow terminal. Avoid unsigned underflow when line numbers grow. */
+     visible(&status, info, strlen(info), 0, width > (dirty ? 2u : 1u) ?
+@@ -5002,6 +5170,11 @@
+         menu_preferred=startup_esc_menu;
+         tell("Esc opens: %s (saved). Movement/edit unchanged.",menu_preferred ? "Menu" : "Command line");
+         break;
++    case SETTING_WRAP:
++        wrap_enabled=startup_wrap;
++        top=display_start(top); left=0; goal_set=false;
++        tell("Word wrap %s (saved).",wrap_enabled ? "ON" : "OFF");
++        break;
+     case SETTING_MOUSE:
+         mouse_enabled=startup_mouse;
+         mouse_tracking(mouse_enabled);
+@@ -6767,7 +6940,7 @@
+     /* Success shows the new value in place. Errors/warnings retain their
+      * viewer rather than disappearing behind the menu. */
+     if (!viewer_text && !command_mode &&
+-        ((menu_page==MENU_SETTINGS && setting_toggle_index(cmd)>=0) ||
++        (((menu_page==MENU_SETTINGS || menu_page==MENU_HELP) && setting_toggle_index(cmd)>=0) ||
+          chosen->action==MENU_MOVEMENT)) menu_open=true;
+ }
+ static void menu_key(int c)
+@@ -7476,7 +7649,24 @@
+  * clear goal_set so the next vertical run starts from the new column. */
+ static void vertical(int direction, int count)
+ {
+-    size_t start = line_start(cursor), p;
++    size_t start, p;
++    if (wrap_enabled) {
++        start=wrap_at(cursor);
++        if (!goal_set) {goal=wrap_column(start,cursor);goal_set=true;}
++        while (count--) {
++            if (direction<0) {
++                if (!start) break;
++                start=wrap_at(start-1);
++            } else {
++                p=wrap_row(start).next;
++                if (p==SIZE_MAX) break;
++                start=p;
++            }
++        }
++        cursor=wrap_position(start,goal);
++        return;
++    }
++    start=line_start(cursor);
+     if (!goal_set) { goal = column_at(start, cursor); goal_set = true; }
+     while (count--) {
+         if (direction < 0) {
+@@ -7626,6 +7816,16 @@
+     }
+     if (command_mode || mouse_y < 1 || mouse_y > body) return;
+     start=top;
++    if (wrap_enabled) {
++        start=wrap_at(start);
++        for (i=1;i<(size_t)mouse_y;i++) {
++            p=wrap_row(start).next;
++            if (p==SIZE_MAX) break;
++            start=p;
++        }
++        cursor=wrap_position(start,mouse_x>0 ? (size_t)(mouse_x-1) : 0);
++        goal_set=false;group=false;return;
++    }
+     for (i=1;i<(size_t)mouse_y;i++) {
+         p=next_line(start);
+         if (p==start) break;
+@@ -7638,7 +7838,7 @@
+ static void usage(void)
+ {
+     puts("editor " VERSION " - one-file, dependency-light terminal text editor\n"
+-         "Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n"
++         "Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--wrap|--no-wrap] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n"
+          "       editor --help | --manual | --about | --version\n\n"
+          "--no-cmd: disable all external shell commands and filters for this launch.\n"
+          "Build with -DEDITOR_NO_CMD to permanently omit external command execution.\n"
+@@ -7653,7 +7853,8 @@
+          "toggle-startup saves the opposite startup choice; -- ends option parsing.\n"
+          "toggle-esc switches and saves Esc behavior; settings opens preferences.\n"
+          "toggle-signals saves signal handling: OFF exits, ON cancels.\n"
+-         "toggle-mouse and toggle-cliphistory switch and save those settings.\n"
++         "toggle-mouse, toggle-wrap and toggle-cliphistory switch and save those settings.\n"
++         "--wrap / --no-wrap: override display-only word wrapping (default On).\n"
+          "Ctrl-C/Z are not bound. Unsaved text is lost on a default interrupt exit.\n"
+          "Click status bar to open menu if mouse enabled (--mouse).\n"
+          "No default hotkeys. User bindings via 'bind' and 'unbind'.\n\n"
+@@ -7715,11 +7916,13 @@
+             else if (!strcmp(argv[i],"--cli")) menu_preferred=false;
+             else if (!strcmp(argv[i],"--mouse")) mouse_enabled=true;
+             else if (!strcmp(argv[i],"--no-mouse")) mouse_enabled=false;
++            else if (!strcmp(argv[i],"--wrap")) wrap_enabled=true;
++            else if (!strcmp(argv[i],"--no-wrap")) wrap_enabled=false;
+             else if (!strcmp(argv[i],"--movement") || !strcmp(argv[i],"--move")) movement_mode=true;
+             else if (!strcmp(argv[i],"--edit")) movement_mode=false;
+             else if (!strcmp(argv[i],"--no-keys")) keys_disabled=true;
+             else if (!file_arg && (!strcmp(argv[i],"-") || argv[i][0]!='-')) file_arg=i;
+-            else { fputs("Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n",stderr); return 2; }
++            else { fputs("Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--wrap|--no-wrap] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n",stderr); return 2; }
+         }
+         if (file_arg && !strcmp(argv[file_arg],"-")) from_stdin=true;
+         else if (file_arg) filename=resolve_path(argv[file_arg]);

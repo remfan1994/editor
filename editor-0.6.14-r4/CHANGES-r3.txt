@@ -1,0 +1,41 @@
+EDITOR 0.6.14-r3 - INTERIM BUG FIXES
+
+Base: the exact 0.6.14-r2 source. The review compared cumulative sources
+0.6.14, 0.6.22, 0.7.0, 0.7.1, 0.7.3, 0.7.4 and 0.7.5 with r2.
+The separate 0.6.15-0.6.21 and 0.7.2 snapshots were not all inspected.
+
+REINTRODUCED
+- 0.7.0: refuse read-only or OS-unwritable replacement targets before
+  offering an overwrite prompt or allocating the external-content undo
+  steps. Unchanged ordinary saves still do not need file write access.
+- 0.7.3: report the actual existing journal byte/count limit with EFBIG;
+  report file-name length overflow separately. Do not claim history is
+  persisted if the containing directory cannot be synchronized, or if the
+  published inode, size, mode, ownership, link count or modification time
+  does not match. Recheck the observed journal after directory sync. On
+  failure, retain the live chain and its dirty flag for retry; a committed
+  document remains saved. A successful publication is never undone by
+  unlinking its old temporary name during failure cleanup.
+- 0.7.5: validate the entire parsed journal's lengths and cursor offsets
+  before discarding an old redo tail during an external-content rebase.
+  Retain the existing reader and EDUNDO01/02 formats. This does not add an
+  archive parser, reader, or restore command.
+- Apply the 0.7.3 state-path errno correction to the analogous journal
+  path check, and keep history dirty after any failed journal save.
+
+ALREADY RETAINED IN R1/R2
+Original clipboard and private-state checks, selected-slot paste, refusal
+of failed clipboard cuts, readonly file protection, shell descriptor fixes,
+path replacement detection, undo structural checks, resize and undefine
+corrections, symbolic addressing, custom synonyms, no-cmd restrictions,
+and redraw optimizations. No need to import them again.
+
+NOT REINTRODUCED
+Plain mode, environmental checks, emergency recovery, prospective journal
+commit, concurrent-save lock files, archive commands, new menu/settings
+items, new features and file formats. Ordinary saves retain the original
+best-effort undo persistence; an external overwrite is not made conditional
+on a durable prospective journal. Optimistic checks cannot eliminate all
+races with other writers. No changes to liner or existing user state.
+
+This is a maintenance revision, not 1.0 or a guarantee of data recovery.

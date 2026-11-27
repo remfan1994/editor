@@ -1,5 +1,5 @@
 /*
- * editor 0.6.14 - a small, single-file terminal text editor.
+ * editor 0.6.14-r4 - a small, single-file terminal text editor.
  * Build: cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor
  * Run:   ./editor [FILE]
  *
@@ -13,7 +13,7 @@
  * About/manual are read-only pages; q or Esc returns to editing.
  *
  * Uses libc and Unix terminal interfaces, without curses or terminfo.
- * One file, horizontal scrolling, up to 8 MiB. Optional user key bindings.
+ * One file, soft word wrapping or horizontal scrolling, up to 8 MiB. Optional user key bindings.
  * Existing bytes and line endings are preserved; Enter uses the first
  * newline style in the file. Terminal paste converts CR/LF/CRLF to that
  * style; file-backed clipboard commands keep their bytes. New files use LF.
@@ -29,7 +29,22 @@
  * to their targets when opening a file.
  * "write FILE" prompts before overwriting an existing other file.
  * Undo history is saved privately per file after successful writes,
- * and restored on reopening when the saved document matches exactly.
+ * and validated before use on reopening. If the file changed outside the
+ * editor, valid prior history can be extended with one synthetic undo step.
+ * This is saved history, not recovery of unsaved edits after a crash.
+ *
+ * SOURCE GUIDE
+ * The single translation unit keeps build/install simple. Read main() for
+ * startup, signal handling and input routing, then follow the relevant path:
+ *   document changes: edit(), replace_bytes(), history_step();
+ *   bytes vs screen cells: decode(), representation(), layout_at();
+ *   file I/O and saved undo: read_file(), save_file(), journal_load/save();
+ *   commands: command_info[], execute(), execute_script_step();
+ *   terminal protocol: byte(), key(), paste(), draw();
+ *   clipboard context: document_capture(), document_restore().
+ * Most state is file-local and belongs to the main thread. Signal handlers
+ * set flags only; normal control flow performs cleanup and state changes.
+ * CONTRIBUTING.txt describes invariants, extension points and the tests.
  */
 /* OpenBSD hides SIGWINCH under X/Open mode unless BSD interfaces are enabled. */
 #if defined(__OpenBSD__) && !defined(_BSD_SOURCE)
@@ -64,7 +79,28 @@
 #define LIMIT ((size_t)8 * 1024 * 1024)
 #define COMMAND_SIZE 4096
 #define CONFIG_LIMIT ((size_t)32768)
-#define VERSION "0.6.14"
+#define VERSION "0.6.14-r4"
+/* An immutable build policy, or a one-way launch policy. No setting,
+ * command, script or environment variable can turn shell execution back on. */
+#ifdef EDITOR_NO_CMD
+static const bool no_cmd = true;
+#else
+static bool no_cmd = false;
+#endif
+static const char cmd_disabled[] = "External commands disabled (--no-cmd).";
+static bool external_command(const char *name)
+{
+    return !strcmp(name,"shell") || !strcmp(name,"filter") ||
+           !strcmp(name,"filter-lines");
+}
+static const char *cmd_policy(void)
+{
+#ifdef EDITOR_NO_CMD
+    return "disabled (compile-time EDITOR_NO_CMD)";
+#else
+    return no_cmd ? "disabled (--no-cmd)" : "enabled (interactive mode)";
+#endif
+}
 #define COMMAND_HISTORY_MAX 32
 #define JOURNAL_LIMIT ((size_t)128 * 1024 * 1024)
 #define JOURNAL_CHANGE_LIMIT 100000
@@ -98,9 +134,9 @@ static const char exit_notice[] =
 
 static const char manual_text[] =
     "EDITOR MANUAL\n"
-    "editor 0.6.14\n"
+    "editor 0.6.14-r4\n"
     "\n"
-    "RUN: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [FILE|-]\n"
+    "RUN: editor [--menu|--cli] [--mouse|--no-mouse] [--wrap|--no-wrap] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n"
     "\n"
     "EDIT MODE (default): Type text. Arrows, Home/End and PgUp/PgDn move.\n"
     "  Backspace/Delete erase. Enter inserts newline; Tab inserts tab.\n"
@@ -117,6 +153,7 @@ static const char manual_text[] =
     "  help starts here; help NAME gives examples and synonyms.\n"
     "  Esc/q returns to Command>; Enter on a blank prompt resumes editing.\n"
     "  write [FILE]       Save; write FILE changes active filename on success.\n"
+    "                     Read-only targets are refused; use a new filename.\n"
     "  read [FILE]        Open file (save edits before switching).\n"
     "  shell ls -1        Insert shell stdout at cursor (one undo).\n"
     "  filter sort        Replace document with stdout of a filter (one undo).\n"
@@ -137,6 +174,9 @@ static const char manual_text[] =
     "  deleof              Delete cursor through end of document.\n"
     "  backbof             Delete start of document through cursor.\n"
     "  dline A-B          Delete inclusive range.\n"
+    "  dline 104-eof      Delete line 104 through the last line.\n"
+    "  dline top-bottom   Delete all lines.\n"
+    "  Line addresses: top/start/first/bof = first line, bottom/end/last/eof = last line.\n"
     "  N dline            Delete N lines starting at cursor line.\n"
     "  undo [N], redo [N] Move through undo history, default 1.\n"
     "  reverse [INDEX]    Browse undo history; Esc returns to editing.\n"
@@ -145,7 +185,7 @@ static const char manual_text[] =
     "    Bare find prompts; spaces in Find> are preserved exactly.\n"
     "  next/n, prev/p    Next or previous match of last search.\n"
     "  replace, replaceall  Literal replacement; prompts or OLD => NEW.\n"
-    "  goto [LINE [COL]]  Go to a position; top/bottom to endpoints.\n"
+    "  goto [LINE [COL]]  Go to a line; bof/eof alone go to file endpoints.\n"
     "  up/down/left/right [N]  Move N steps.\n"
     "  Config: ~/.config/editor/config or $XDG_CONFIG_HOME/editor/config.\n"
     "    startup=movement or startup=edit (default); --movement/--edit overrides.\n"
@@ -153,6 +193,9 @@ static const char manual_text[] =
     "  settings           Open Help > Settings.\n"
     "  toggle-startup     Switch and save startup: Edit / Movement.\n"
     "  toggle-mouse       Switch and save optional mouse input.\n"
+    "  toggle-wrap        Switch and save word wrap (default ON; display only).\n"
+    "    --wrap/--no-wrap override one launch. Up/Down follow visual rows.\n"
+    "    Home/End and line commands use logical file lines.\n"
     "  toggle-signals     Switch and save signal handling (default OFF).\n"
     "  toggle-cliphistory Switch and save clipboard history (default OFF).\n"
     "  settings show      Inspect current/saved values and config path.\n"
@@ -164,12 +207,17 @@ static const char manual_text[] =
 static const char manual_extension[] =
     "SHELL/SCRIPTS: Commands run explicitly under the editor's OS user.\n"
     "  Root editor runs child shell as root. No script runs on file open.\n"
+    "  --no-cmd disables shell, filter and filter-lines (including aliases).\n"
+    "  Build with -DEDITOR_NO_CMD to remove external execution permanently.\n"
+    "  Scripts and user commands cannot bypass this policy. Not a jail.\n"
     "  Shell captures stdout only; nonzero exit, binary or size errors refuse edit.\n"
     "  Script files: one command per line; # comments; 200 steps and 8 levels.\n"
     "  Scripts permit shell/filter/find/goto/undo/redo/movement/edit/run.\n"
     "  Each script edit is its own undo step; no rollback of earlier steps.\n"
     "  Definitions: ~/.config/editor/commands.conf (XDG override).\n"
-    "  User names are lowercase ASCII; built-in commands cannot be redefined.\n"
+    "  Canonical commands are reserved; define can replace factory synonyms.\n"
+    "  Undefine restores a displaced synonym; names are saved per user.\n"
+    "  Use canonical names in scripts and hotkeys for stable behavior.\n"
     "  A direct user command runs like typed input, including normal prompts.\n"
     "  define q1 quit! makes q1 discard unsaved edits and exit when invoked.\n"
     "  Scripts retain their restricted commands, including through aliases.\n"
@@ -210,22 +258,39 @@ static const char manual_extension[] =
 /* Two source string literals avoid the ISO C99 4095-byte literal limit. */
 static const char *manual_full(void)
 {
-    static char whole[sizeof manual_text + sizeof manual_extension];
+    static char whole[sizeof manual_text + sizeof manual_extension + 128];
     if (!whole[0]) {
         memcpy(whole,manual_text,sizeof manual_text-1);
         memcpy(whole+sizeof manual_text-1,manual_extension,sizeof manual_extension);
+        snprintf(whole+strlen(whole),sizeof whole-strlen(whole),
+                 "\nExternal command policy: %s.\n",cmd_policy());
     }
     return whole;
 }
+/* Owned byte storage: n counts content bytes; cap counts allocated bytes.
+ * {0} is a valid empty buffer. reserve() alone adds no terminator; document
+ * and C-string consumers must arrange s[n] == '\0' with room for that byte.
+ * Do not shallow-copy an owning Buffer except as an explicit ownership move.
+ * UI output uses this type too, so not every Buffer contains document text. */
 typedef struct { char *s; size_t n, cap; } Buffer;
 typedef struct Change Change;
+/* One replacement at byte offset at. old_s/new_s own length-delimited byte
+ * arrays, not C strings; before/after are cursor byte positions. A node
+ * remains in the doubly linked chain while undone so redo can reuse it. */
 struct Change {
     size_t at, before, after, old_n, new_n, new_cap;
     size_t ordinal; /* 1-based history position; constant-time undo depth. */
     char *old_s, *new_s;
     Change *prev, *next;
 };
+/* text is the active document; saved is its accepted saved-content baseline
+ * (empty for initially piped input, updated by file save or unnamed write -).
+ * changed() compares bytes, not undo depth: undoing back to saved content
+ * makes the document clean again. */
 static Buffer text, saved;
+/* cursor/top are byte offsets; top begins a displayed document line.
+ * left/goal are terminal-cell columns, not bytes or Unicode code points.
+ * goal preserves the desired column across vertical moves over short lines. */
 static size_t cursor, top, left, goal;
 /* A bounded, literal search pattern.  No regex or additional libraries.
  * search_mark is a display-only match; edits invalidate the mark. */
@@ -241,6 +306,7 @@ static bool movement_mode;
 static bool startup_config_warning;
 /* Saved startup preference is independent of the current document mode. */
 static bool startup_movement, startup_esc_menu, startup_signals, startup_mouse;
+static bool wrap_enabled, startup_wrap = true;
 static bool startup_sync_warning;
 static int startup_config_error;
 /* OFF leaves interrupt/stop to terminal job control. ON opts into the
@@ -268,11 +334,15 @@ static bool loaded_journal_stat_valid;
 static bool journal_ignored;
 static bool journal_dirty;
 static bool journal_rebased, journal_branched;
+/* filename is owned and canonicalized. existed/original describe the disk
+ * version last accepted for that name, not the current unsaved text. */
 static char *filename;
 static bool existed;
 static struct stat original;
 static char newline[2] = {'\n', 0};
 static size_t newline_n = 1;
+/* history/history_tail bound the chain. current is the last applied node, or
+ * NULL before the first change; nodes after current form the redo branch. */
 static Change *history, *current, *history_tail;
 /* Only active inside the dedicated, non-editing undo browser. */
 static bool reverse_mode;
@@ -287,7 +357,9 @@ static size_t reverse_position, reverse_total;
 /* Editing clipboard.txt is a temporary one-level document context.  Save the
  * original document by moving ownership of its buffers, history and journal
  * into this structure.  No copy of an 8 MiB file is needed, and dirty edits
- * are preserved until returning from the clipboard. */
+ * are preserved until returning from the clipboard. When adding document
+ * state, update both document_capture() and document_restore(); process-wide
+ * settings, terminal state and command history intentionally stay global. */
 typedef struct {
     Buffer text, saved;
     size_t cursor, top, left, goal;
@@ -327,6 +399,8 @@ static int64_t discard_until;
  * paste data, never commands. Resume draining after interrupt/suspend. */
 static bool paste_discard;
 static size_t paste_end_matched;
+/* Viewers borrow persistent strings or reusable page buffers. They neither
+ * allocate nor free this text; never point them at an expired local buffer. */
 static const char *viewer_text, *viewer_title;
 static size_t viewer_top;
 
@@ -347,12 +421,13 @@ static const char help_topics[] =
     "  movement / edit changes only this session's text-entry mode.\n"
     "  toggle-esc switches the ONE saved Esc choice: Menu or Command line.\n"
     "  toggle-signals switches and saves interrupt behavior; OFF is the default.\n"
-    "  toggle-mouse and toggle-cliphistory also switch and save their choices.\n"
+    "  toggle-mouse, toggle-wrap and toggle-cliphistory switch and save their choices.\n"
     "  Each toggle takes NO arguments. settings show gives current/saved values and path.\n\n"
     "EXTENDING EDITOR\n"
     "  shell COMMAND inserts stdout at cursor; shell alone asks for command.\n"
     "  filter COMMAND replaces document with stdout (one undo).\n"
     "  filter-lines N-M COMMAND transforms complete numbered lines.\n"
+    "  External commands are unavailable in --no-cmd sessions/builds.\n"
     "  define NAME COMMAND saves a custom command. functions lists them.\n"
     "  run FILE executes trusted plaintext scripts, never automatically.\n\n"
     "HELP - start here\n"
@@ -403,6 +478,9 @@ static unsigned script_steps, script_depth;
 static bool external_cancel_notice;
 
 
+/* Capacity management only: each caller enforces its own document, config or
+ * output limit. Successful growth does not change b->n or add a terminator;
+ * failed realloc leaves the existing allocation and descriptor usable. */
 static bool reserve(Buffer *b, size_t n)
 {
     size_t cap;
@@ -416,6 +494,10 @@ static bool reserve(Buffer *b, size_t n)
         if (cap > SIZE_MAX / 2) { cap = n; break; }
         cap *= 2;
     }
+    /* Avoid doubling an exactly full document from 8 to 16 MiB merely
+     * to store its NUL terminator. This is a soft capacity boundary,
+     * not a new limit on generic buffers. */
+    if (n <= LIMIT + 1 && cap > LIMIT + 1) cap = LIMIT + 1;
     s = realloc(b->s, cap);
     if (!s) return false;
     b->s = s; b->cap = cap;
@@ -423,6 +505,8 @@ static bool reserve(Buffer *b, size_t n)
 }
 
 static void layout_reset(void);
+/* Copy counted bytes and append a convenience NUL outside the payload.
+ * s must not alias b's allocation, which reserve() may relocate. */
 static bool copy_buffer(Buffer *b, const char *s, size_t n)
 {
     if (n == SIZE_MAX || (n && !s)) { errno = EINVAL; return false; }
@@ -466,6 +550,8 @@ static void tell(const char *format, ...)
     va_end(ap);
 }
 
+/* Savedness is byte equality, not an undo position: undo can return to the
+ * saved text, and a new history branch can also produce identical bytes. */
 static bool changed(void)
 {
     return text.n != saved.n || (text.n && memcmp(text.s, saved.s, text.n));
@@ -509,6 +595,8 @@ static void die(const char *s)
     exit(1);
 }
 
+/* Drawing-only builder. A failed append marks the entire frame unusable;
+ * this sticky error convention must not be reused for document mutations. */
 static void add(Buffer *b, const char *s, size_t n)
 {
     if (drawing_failed) return;
@@ -523,7 +611,9 @@ static void add(Buffer *b, const char *s, size_t n)
 
 static void output(Buffer *b, const char *s) { add(b, s, strlen(s)); }
 
-/* Decode one UTF-8 code point. Invalid bytes remain individual units. */
+/* Return source bytes consumed, with the code point in *cp. Invalid input
+ * consumes one byte and uses 0xffffffffu as a sentinel, so movement/display
+ * always make progress without repairing or dropping the original bytes. */
 static size_t decode(const char *s, size_t n, size_t p, uint32_t *cp)
 {
     unsigned char c;
@@ -548,6 +638,8 @@ static size_t decode(const char *s, size_t n, size_t p, uint32_t *cp)
     *cp = u; return count;
 }
 
+/* Movement/deletion treat CRLF as one unit and valid UTF-8 as code points,
+ * not grapheme clusters. Both helpers take and return byte offsets. */
 static size_t next_pos(const char *s, size_t n, size_t p)
 {
     uint32_t cp;
@@ -568,6 +660,8 @@ static size_t prev_pos(const char *s, size_t n, size_t p)
     return p - 1;
 }
 
+/* File line boundaries are LF or CRLF. A bare CR remains ordinary data;
+ * only terminal paste and captured shell output normalize such newlines. */
 static size_t line_end(size_t p)
 {
     const char *lf = p < text.n ? memchr(text.s+p,'\n',text.n-p) : NULL;
@@ -582,7 +676,10 @@ static size_t next_line(size_t p)
     return lf ? (size_t)(lf-text.s)+1 : text.n;
 }
 
-/* Convert a unit to printable bytes and its terminal-cell width. */
+/* Return source bytes consumed, separately from rendered terminal-cell width.
+ * Control/invalid/nonprinting bytes are shown as visible escapes, never sent
+ * to the terminal as document-supplied control sequences. Tab width depends
+ * on the document column, not the viewport's left edge. */
 static size_t representation(const char *s, size_t n, size_t p, size_t column,
                              char out[32], int *width, bool *wide)
 {
@@ -611,18 +708,34 @@ static size_t representation(const char *s, size_t n, size_t p, size_t column,
 }
 
 /* Sparse, expendable position information bounds rescanning while scrolling
- * near EOF or across a long line. One checkpoint per 4096 bytes costs at most
- * 64 KiB plus one 32-byte checkpoint on a 64-bit host. Text and undo remain
- * the sole authoritative data.
+ * near EOF or across a long line. The array holds LIMIT/4096 + 1 checkpoints;
+ * a recent point and count are the only additional cache state. Text and undo
+ * remain the sole authoritative data.
  * Checkpoints lie at decoded-unit boundaries, including CRLF boundaries. */
 #define LAYOUT_STEP 4096
+/* byte/start are byte offsets; line is 1-based and column counts display
+ * cells from zero. Cache contents belong only to the active text buffer. */
 typedef struct { size_t byte, line, start, column; } LayoutPoint;
 static LayoutPoint layout_points[LIMIT / LAYOUT_STEP + 1];
 static size_t layout_count;
 static LayoutPoint layout_recent;
+/* Display-only row starts. Sparse checkpoints bound rescanning without
+ * indexing every wrapped row. No document or journal format is changed. */
+static size_t wrap_points[LIMIT / LAYOUT_STEP + 1];
+static size_t wrap_count, wrap_recent, wrap_width;
+static void wrap_invalidate(size_t at)
+{
+    /* A row can look ahead at most width+1 UTF-8 units before deciding
+     * its word break. Include CRLF and malformed UTF-8 overlap. */
+    size_t margin = 4 * (wrap_width + 1) + 4;
+    size_t safe = at > margin ? at - margin : 0;
+    while (wrap_count > 1 && wrap_points[wrap_count-1] > safe) wrap_count--;
+    if (wrap_recent > safe) wrap_recent = wrap_count ? wrap_points[wrap_count-1] : 0;
+}
 
 static void layout_reset(void)
 {
+    wrap_count=0; wrap_recent=0;
     layout_count=1;
     layout_points[0]=(LayoutPoint){0,1,0,0};
     layout_recent=layout_points[0];
@@ -633,12 +746,15 @@ static void layout_invalidate(size_t at)
     /* A byte edit can complete a formerly invalid UTF-8 sequence or CRLF
      * starting just before it. Keep only checkpoints before that overlap. */
     size_t safe=at>3 ? at-3 : 0;
+    wrap_invalidate(at);
     if (!layout_count) layout_reset();
     while (layout_count>1 && layout_points[layout_count-1].byte>safe)
         layout_count--;
     if (layout_recent.byte>safe) layout_recent=layout_points[layout_count-1];
 }
 
+/* Keep this width calculation in step with representation(). A display-rule
+ * change otherwise makes cached cursor positions disagree with drawn text. */
 static void layout_advance(LayoutPoint *point, size_t limit)
 {
     unsigned char c=(unsigned char)text.s[point->byte];
@@ -722,9 +838,11 @@ static size_t column_at(size_t start, size_t p)
     return column;
 }
 
-static size_t position_at(size_t start, size_t column)
+/* Map a display column back to a byte offset on this line. A target inside a
+ * tab, wide character or visible escape selects that unit's beginning. */
+static size_t position_in_line(size_t start, size_t end, size_t column)
 {
-    size_t end = line_end(start), x = 0, count;
+    size_t x = 0, count;
     size_t lo=0,hi=layout_count,mid;
     char rep[32]; int width; bool wide;
     /* Existing checkpoints can skip the off-screen prefix. Do not build
@@ -748,10 +866,106 @@ static size_t position_at(size_t start, size_t column)
     return start;
 }
 
+static size_t position_at(size_t start, size_t column)
+{
+    return position_in_line(start, line_end(start), column);
+}
+
+/* A visual row uses its own tab stops. Whitespace is retained, including
+ * the space at a word break. Long words split only between decoded units.
+ * SIZE_MAX denotes the last row; an ending LF creates an empty EOF row. */
+typedef struct { size_t end, next; } WrapRow;
+static size_t current_wrap_width(void)
+{
+    return cols > 1 ? (size_t)(cols-1) : 1;
+}
+static size_t newline_bytes(size_t p)
+{
+    if (p >= text.n) return 0;
+    if (text.s[p]=='\n') return 1;
+    return text.s[p]=='\r' && p+1<text.n && text.s[p+1]=='\n' ? 2 : 0;
+}
+static WrapRow wrap_row(size_t start)
+{
+    size_t p=start, x=0, split=start, n, nl, width=current_wrap_width();
+    char rep[32]; int cells; bool wide;
+    while (p<text.n && !newline_bytes(p)) {
+        n=representation(text.s,text.n,p,x,rep,&cells,&wide);
+        if ((size_t)cells>width-x) {
+            if (p==start) { /* undersized window still makes progress */
+                p+=n; nl=newline_bytes(p);
+                return (WrapRow){p,nl ? p+nl : p==text.n ? SIZE_MAX : p};
+            }
+            else if (split>start) p=split;
+            return (WrapRow){p, p==text.n ? SIZE_MAX : p};
+        }
+        if (text.s[p]==' ' || text.s[p]=='\t') split=p+n;
+        p+=n; x+=(size_t)cells;
+    }
+    nl=newline_bytes(p);
+    return (WrapRow){p,nl ? p+nl : SIZE_MAX};
+}
+static size_t wrap_at(size_t target)
+{
+    size_t lo=0, hi, mid, p;
+    WrapRow row;
+    if (target>text.n) target=text.n;
+    if (!wrap_count || wrap_width!=current_wrap_width()) {
+        if (wrap_width!=current_wrap_width()) goal_set=false;
+        wrap_width=current_wrap_width(); wrap_count=1;
+        wrap_points[0]=wrap_recent=0;
+    }
+    hi=wrap_count;
+    while (lo+1<hi) {
+        mid=lo+(hi-lo)/2;
+        if (wrap_points[mid]<=target) lo=mid; else hi=mid;
+    }
+    p=wrap_points[lo];
+    if (wrap_recent>p && wrap_recent<=target) p=wrap_recent;
+    for (;;) {
+        if (p>=wrap_points[wrap_count-1]+LAYOUT_STEP &&
+            wrap_count<sizeof wrap_points/sizeof *wrap_points)
+            wrap_points[wrap_count++]=p;
+        row=wrap_row(p);
+        if (row.next==SIZE_MAX || row.next>target) break;
+        p=row.next;
+    }
+    wrap_recent=p; return p;
+}
+static size_t wrap_column(size_t start, size_t p)
+{
+    size_t x=0; char rep[32]; int cells; bool wide;
+    while (start<p) {
+        start+=representation(text.s,p,start,x,rep,&cells,&wide);
+        x+=(size_t)cells;
+    }
+    return x;
+}
+static size_t wrap_position(size_t start, size_t column)
+{
+    WrapRow row=wrap_row(start);
+    size_t x=0,n; char rep[32]; int cells; bool wide;
+    while (start<row.end) {
+        n=representation(text.s,row.end,start,x,rep,&cells,&wide);
+        if (x+(size_t)cells>column) break;
+        x+=(size_t)cells; start+=n;
+    }
+    /* A soft boundary belongs to the next row, not the current one. */
+    if (start==row.end && row.next==row.end)
+        start=prev_pos(text.s,text.n,start);
+    return start;
+}
+static size_t display_start(size_t p)
+{
+    return wrap_enabled ? wrap_at(p) : line_start(p);
+}
+
 /* Search only the candidate start positions in [first, limit). A forward
  * search stops at its first match; a backward search retains the last one.
  * KMP still handles repetitive/overlapping text in linear time. Restricting
- * the range avoids rescanning the whole prefix on every "next" command. */
+ * the range avoids rescanning the whole prefix on every "next" command.
+ * true means the scan completed, including no match (*match == SIZE_MAX);
+ * false means cancellation. Matching is literal bytes, not Unicode folding. */
 static bool search_range(size_t first, size_t limit, bool forward,
                          const size_t *failure, size_t *match)
 {
@@ -917,6 +1131,9 @@ static void free_changes(Change *p)
     }
 }
 
+/* Lowest-level splice: update text and invalidate layout, but do not record
+ * history or change the cursor. s must be independent of text's allocation;
+ * reserve/memmove may relocate or overwrite bytes inside that allocation. */
 static bool replace_bytes(size_t at, size_t old_n, const char *s, size_t n)
 {
     size_t length;
@@ -931,6 +1148,10 @@ static bool replace_bytes(size_t at, size_t old_n, const char *s, size_t n)
     return true;
 }
 
+/* Normal document mutations enter here. Reserve text and own the undo bytes
+ * before discarding any redo branch, so allocation failure preserves text
+ * and history. s must not alias text; typing permits adjacent insertion to
+ * join the current transaction, while paste/filter/commands pass false. */
 static bool edit(size_t at, size_t old_n, const char *s, size_t n, bool typing)
 {
     Change *p;
@@ -973,8 +1194,9 @@ static bool edit(size_t at, size_t old_n, const char *s, size_t n, bool typing)
         p->at = at; p->old_n = old_n; p->new_n = n; p->new_cap = n;
         p->before = cursor; p->after = at + n; p->prev = current;
         p->ordinal = current ? current->ordinal + 1 : 1;
-        /* Keep previously saved alternate futures reachable as stale
-         * journals; branching must not silently erase an older path. */
+        /* The in-memory redo tail is discarded. Mark the branch so the next
+         * journal save archives the previous on-disk history, if present;
+         * an unsaved redo tail has no persistent copy to preserve. */
         if (current) {
             journal_branched |= current->next != NULL;
             free_changes(current->next); current->next = p;
@@ -988,7 +1210,7 @@ static bool edit(size_t at, size_t old_n, const char *s, size_t n, bool typing)
     journal_dirty = true;
     search_mark = SIZE_MAX;
     group = typing; goal_set = false; message[0] = 0;
-    top = line_start(top > text.n ? text.n : top);
+    top = display_start(top > text.n ? text.n : top);
     return true;
 memory_error:
     tell("Not enough memory. Text unchanged."); return false;
@@ -1025,14 +1247,15 @@ static bool history_step(bool redo)
     search_mark = SIZE_MAX;
     current = redo ? p : p->prev;
     journal_dirty = true;
-    top = line_start(top > text.n ? text.n : top);
+    top = display_start(top > text.n ? text.n : top);
     return true;
 }
 
 static size_t undo_depth(void);
 static size_t redo_depth(void);
 /* One command can move many steps without allocating additional history.
- * Large requests stop at the earliest/latest available transaction. */
+ * Large requests stop at the earliest/latest available transaction. Each
+ * successful step stands if a later step fails or a signal interrupts. */
 static size_t history_move(bool redo, size_t requested, bool quiet)
 {
     size_t available = reverse_mode ? (redo ? reverse_total - reverse_position : reverse_position) :
@@ -1064,7 +1287,9 @@ static void reverse_open(void)
     menu_open = false;
     message[0] = 0;
 }
-/* Resolve existing links, or the parent of a not-yet-existing file. */
+/* Return a caller-owned canonical path: resolve existing links, or only the
+ * parent when the final file does not exist. This chooses a name, not a lock;
+ * readers/writers must still check the object opened through that name. */
 static char *resolve_path(const char *name)
 {
     char *expanded = NULL, *path, *copy, *slash, *parent, *result;
@@ -1098,6 +1323,9 @@ static char *resolve_path(const char *name)
     free(copy); free(parent); return result;
 }
 
+/* Append raw stream bytes, without newline conversion or NUL rejection.
+ * A failure can leave partial data in b; callers decide whether to discard
+ * it and validate text before exposing it as an editable document. */
 static bool read_stream(int fd, Buffer *b)
 {
     char chunk[8192]; ssize_t n;
@@ -1118,16 +1346,20 @@ static bool read_stream(int fd, Buffer *b)
 }
 
 static bool same_disk_version(const struct stat *a, const struct stat *b);
+/* Read raw bytes from a regular file without following a final symlink.
+ * b is scratch storage: on failure its contents may be partial. Callers use
+ * a separate buffer to preserve the active document, and reject NUL bytes
+ * where text is required. Stat checks detect observed changes, not locking. */
 static bool read_file(const char *path, Buffer *b, struct stat *st)
 {
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
-    struct stat after;
+    struct stat after, named;
     char chunk[8192]; ssize_t n;
     bool ok = false;
     if (b==&text) layout_reset();
     if (fd < 0) return false;
     if (fstat(fd, st) < 0) goto done;
-    if (!S_ISREG(st->st_mode)) { errno = EINVAL; goto done; }
+    if (!S_ISREG(st->st_mode)) { errno = S_ISDIR(st->st_mode) ? EISDIR : EINVAL; goto done; }
     if (st->st_size < 0 || (uint64_t)st->st_size > LIMIT) {
         errno = EFBIG; goto done;
     }
@@ -1148,6 +1380,8 @@ static bool read_file(const char *path, Buffer *b, struct stat *st)
      * version to show or overwrite. Reject and let the user retry. */
     if (fstat(fd, &after) < 0) goto done;
     if (!same_disk_version(st, &after)) { errno = EAGAIN; goto done; }
+    if (lstat(path, &named) < 0) goto done;
+    if (!same_disk_version(&after, &named)) { errno = EAGAIN; goto done; }
     ok = true;
 done:
     { int error = errno; if (close(fd) < 0 && ok) return false; errno = error; }
@@ -1185,7 +1419,9 @@ static void clear_prompt(void)
     pending_write_path = NULL;
 }
 /* A confirmation is tied to one observed version of one target. A changed
- * target triggers a NEW confirmation instead of reusing an old yes. */
+ * target triggers a NEW confirmation instead of reusing an old yes. Taking
+ * ownership of *disk keeps the approved bytes alive after save_file returns;
+ * clear_prompt() releases them on cancellation or when replacing a prompt. */
 static void ask_overwrite(Buffer *disk, const struct stat *st,
                           const char *target, bool other_file)
 {
@@ -1282,6 +1518,8 @@ static int read_exact(int fd, void *out, size_t n)
     }
     return 0;
 }
+/* Journal integers are fixed-width, little-endian bytes, never native C
+ * structs. Keep buffered journal_number/read_number compatible with these. */
 static int put_number(int fd, uint64_t v)
 {
     unsigned char b[8];
@@ -1399,15 +1637,22 @@ static uint64_t path_hash(const char *s)
     while (*s) { h ^= (unsigned char)*s++; h *= UINT64_C(1099511628211); }
     return h;
 }
-/* Only use directories, never symbolic links, for state storage. */
+/* Create a missing component privately and reject non-directories/symlinks.
+ * Existing ancestor permissions are not changed or checked here; callers
+ * separately check ownership and privacy of the final state directory. */
 static bool private_directory(const char *path)
 {
     struct stat st;
     if (mkdir(path, 0700) < 0 && errno != EEXIST) return false;
-    if (lstat(path, &st) < 0 || !S_ISDIR(st.st_mode)) return false;
+    if (lstat(path, &st) < 0) return false;
+    if (!S_ISDIR(st.st_mode)) { errno=ENOTDIR; return false; }
     return true;
 }
 static void open_viewer(const char *title, const char *contents);
+/* The command registry supplies names, aliases, help and completion. It is
+ * not a table of callbacks: execute() implements interactive behavior, while
+ * execute_script_step() deliberately admits only a noninteractive subset.
+ * A new command needs its dispatcher and documentation updated together. */
 typedef struct {
     const char *name, *synonyms, *syntax, *description;
     unsigned section;
@@ -1422,7 +1667,7 @@ static const char *const command_sections[] = {
 static const CommandHelp command_info[] = {
     {"write", "save, w", "write [FILE|-]",
      "Save or prompt for a name; write FILE switches the active file after saving. Confirm "
-     "before replacing an existing other file. write - sends the document to redirected stdout.",
+     "before replacing an existing other file. Read-only targets are refused. write - sends the document to redirected stdout.",
      0, "Save the active file, or save under a new name.",
      "write\n"
      "  Save this file; an unnamed document asks for a filename.\n"
@@ -1462,12 +1707,15 @@ static const CommandHelp command_info[] = {
     {"filter-lines", "filter-range", "filter-lines FIRST[-LAST] COMMAND",
      "Send the specified complete line or numbered inclusive range through a command. "
      "Only that range is replaced. Results use the document newline style; stdout may "
-     "be empty. Entire replacement is one undoable edit.",
+     "be empty. Entire replacement is one undoable edit. "
+     "Use top/start/first/bof for the first line and bottom/end/last/eof for the last.",
      2, "Filter only a numbered line or range.",
      "filter-lines 3 sort\n"
      "  Filter line 3.\n"
      "filter-lines 3-9 sort -u\n"
-     "  Sort and deduplicate lines 3 through 9."},
+     "  Sort and deduplicate lines 3 through 9.\n"
+     "filter-lines 104-eof sort\n"
+     "  Sort from line 104 through the last line."},
     {"ls", "dir, files, directory", "ls [DIRECTORY]",
      "Browse directory entries in a scrollable viewer. Defaults to the current directory.",
      0, "Look at the files in a directory without leaving editor.",
@@ -1493,7 +1741,8 @@ static const CommandHelp command_info[] = {
      "  Show saved clipboard slots."},
     {"copy", "yank, copyline", "copy [LINE|FIRST-LAST]",
      "Copy complete lines to the selected clipboard without changing the document. A number "
-     "after copy is a LINE number, not a clipboard slot.",
+     "after copy is a LINE number, not a clipboard slot. Unsafe clipboard targets are refused. "
+     "Use top/start/first/bof for the first line and bottom/end/last/eof for the last.",
      3, "Copy lines without removing them.",
      "copy\n"
      "  Copy the current line to the selected clipboard.\n"
@@ -1501,18 +1750,23 @@ static const CommandHelp command_info[] = {
      "  Copy document line 5, not clipboard 5.\n"
      "copy 10-15\n"
      "  Copy lines 10 through 15.\n"
+     "copy 104-end\n"
+     "  Copy from line 104 through the last line.\n"
      "clipboard 2\n"
      "  Select clipboard 2 for subsequent copy or cut commands."},
     {"cut", "cutline, movelines", "cut [LINE|FIRST-LAST]",
      "Copy complete lines to the selected clipboard, then delete them in one undoable edit. "
-     "Numeric arguments are line numbers, not clipboard slots.",
+     "Numeric arguments are line numbers, not clipboard slots. Uncertain clipboard publication leaves text intact. "
+     "Use top/start/first/bof for the first line and bottom/end/last/eof for the last.",
      3, "Move lines to the clipboard and remove them here.",
      "cut\n"
      "  Cut the current line into the selected clipboard.\n"
      "cut 2\n"
      "  Cut document line 2, not into clipboard 2.\n"
      "cut 6-9\n"
-     "  Cut lines 6 through 9. undo restores the removed text."},
+     "  Cut lines 6 through 9. undo restores the removed text.\n"
+     "cut 104-eof\n"
+     "  Cut from line 104 through the last line."},
     {"paste", "put, insertclip", "paste [SLOT|default]",
      "Insert lines from the selected clipboard, or paste 2 from slot 2, without changing the "
      "selected slot. Each paste is one undoable edit.",
@@ -1544,13 +1798,20 @@ static const CommandHelp command_info[] = {
      "clipuse\n"
      "  Ask for a snapshot number."},
     {"dline", "delline, delete-line, delete, remove-line", "dline [LINE|FIRST-LAST]",
-     "Delete a line or inclusive range. Also: COUNT dline deletes COUNT lines from the cursor. "
+     "Delete a line or inclusive range. Use top/start/first/bof for the first line and bottom/end/last/eof "
+     "for the last. Also: COUNT dline deletes COUNT lines from the cursor. "
      "One undo step.",
      2, "Delete the current line or a range of numbered lines.",
      "dline\n"
      "  Delete the current line.\n"
      "dline 30-43\n"
      "  Delete lines 30 through 43, including both ends.\n"
+     "dline 104-end\n"
+     "dline 104-eof\n"
+     "  Delete line 104 through the last line, inclusive.\n"
+     "dline bof-eof\n"
+     "dline top-bottom\n"
+     "  Delete the entire document.\n"
      "13 dline\n"
      "  Delete 13 lines starting at the cursor.\n"
      "undo\n"
@@ -1654,20 +1915,23 @@ static const CommandHelp command_info[] = {
      "undo\n"
      "  Reverse the whole replacement."},
     {"goto", "go, line, jump", "goto [LINE [COLUMN]]",
-     "Move to a 1-based line and optional visual column.",
+     "Move to a 1-based line and optional visual column. "
+     "Use top/start/first/bof for the first line and bottom/end/last/eof for the last.",
      5, "Move to a numbered line and optional column.",
      "goto\n"
      "  Ask for a line number.\n"
      "goto 50\n"
      "  Move to line 50.\n"
      "goto 50 12\n"
-     "  Move to line 50, column 12. Both start at 1."},
-    {"top", "first, start", "top",
+     "  Move to line 50, column 12. Both start at 1.\n"
+     "goto eof\n"
+     "  Move to the start of the last line. eof alone goes to the file end."},
+    {"top", "first, start, bof", "top",
      "Move to the beginning of the document.",
      5, "Go to the start of the document.",
      "top\n"
      "  Move to the first character."},
-    {"bottom", "last, end", "bottom",
+    {"bottom", "last, end, eof", "bottom",
      "Move to the end of the document.",
      5, "Go to the end of the document.",
      "bottom\n"
@@ -1750,6 +2014,12 @@ static const CommandHelp command_info[] = {
      "  Switch mouse input and remember the result.\n"
      "toggle-mouse\n"
      "  Switch back. Off leaves ordinary selection to your terminal."},
+    {"toggle-wrap", "", "toggle-wrap",
+     "Switch and save display-only word wrap (default On). --wrap/--no-wrap override one launch. "
+     "No file bytes, line numbers or undo history change. No arguments.",
+     6, "Switch between word wrap and horizontal scrolling.",
+     "toggle-wrap\n  Switch word wrap On/Off and save the preference.\n"
+     "  Also available in Help and Help > Settings. Up/Down follow visual rows."},
     {"toggle-signals", "toggle-signal-controls", "toggle-signals",
      "Switch and save interrupt handling. OFF (default): terminal interrupt exits without "
      "saving. ON: interrupt cancels pending input. Stop always suspends. No key is bound and "
@@ -1775,7 +2045,7 @@ static const CommandHelp command_info[] = {
     {"settings", "options, preferences", "settings [show]",
      "Open Help > Settings, or use settings show to inspect current/saved values and config "
      "path. Each switch is one row with its current value. Selecting it runs the matching "
-     "toggle-* command and saves. Startup affects the next launch; Esc, mouse, signals and "
+     "toggle-* command and saves. Startup affects the next launch; Esc, mouse, wrap, signals and "
      "clipboard history apply now. Failed saves leave behavior unchanged. No default command "
      "hotkeys.",
      6, "Inspect or change saved preferences in Help > Settings.",
@@ -1789,6 +2059,7 @@ static const CommandHelp command_info[] = {
      "  Switch Command line / Menu for Esc now and next launch.\n"
      "toggle-mouse\n"
      "  Switch mouse Off / On now and next launch.\n"
+     "toggle-wrap\n  Switch display-only word wrapping now and next launch.\n"
      "toggle-signals\n"
      "  Switch interrupt Exits / Cancels; Ctrl+Z always suspends.\n"
      "toggle-cliphistory\n"
@@ -1825,7 +2096,9 @@ static const CommandHelp command_info[] = {
      "Command>. Use define NAME run FILE to bind it to a multi-line script. "
      "Direct aliases retain ordinary prompts and unsaved-work checks; scripts "
      "keep their restricted command set, including inside aliases. "
-     "Names are lowercase ASCII; built-in commands and aliases cannot be replaced. "
+     "Canonical commands are reserved. Factory synonyms can be redefined; the custom name "
+     "replaces the synonym until undefine restores it. Names are lowercase ASCII; existing "
+     "punctuation synonyms such as q! and ? are also allowed. "
      "Definitions load as inert data; nothing runs on startup.",
      6, "Assign a saved user-defined name to an editor command.",
      "define dirlist shell ls -1\n"
@@ -1835,13 +2108,18 @@ static const CommandHelp command_info[] = {
      "define clean run /home/user/clean.editor\n"
      "  Save a custom script command.\n"
      "functions\n"
-     "  See all definitions."},
+     "  See all definitions.\n"
+     "define save goto eof\n"
+     "  Replace the factory save synonym; write still saves."},
     {"undefine", "undef, delete-function", "undefine NAME",
      "Remove a named user command from the persistent commands.conf file. "
+     "Any displaced factory synonym becomes available again. "
      "Changes are saved atomically; a changed external configuration is not overwritten.",
      6, "Remove one saved custom command.",
      "undefine dirlist\n"
-     "  Remove the user-defined dirlist command."},
+     "  Remove the user-defined dirlist command.\n"
+     "undefine save\n"
+     "  If save was redefined, restore its factory meaning."},
     {"functions", "user-commands, definitions", "functions [reload]",
      "List user-defined commands or reload their secure plaintext definitions from disk. "
      "Stored in ~/.config/editor/commands.conf (or XDG_CONFIG_HOME/editor). "
@@ -1885,7 +2163,7 @@ static const CommandHelp command_info[] = {
      "help cut\n"
      "  See examples and synonyms for cutting lines.\n"
      "help save\n"
-     "  See write help through its save synonym."},
+     "  See write help through save, unless save was redefined."},
     {"list", "commands, cmdlist", "list [TOPIC]",
      "Browse commands by task, or filter by words in their names, synonyms, descriptions or "
      "category. Nothing in the list runs by itself.",
@@ -1913,24 +2191,70 @@ static const CommandHelp command_info[] = {
      "There is no confirmation. Use write then quit to keep your work."},
 };
 #define COMMAND_INFO_COUNT (sizeof command_info / sizeof command_info[0])
-static const CommandHelp *command_lookup(const char *name)
+/* Canonical names always win. A custom definition suppresses a factory
+ * synonym, not the underlying operation. Keep the registry immutable so
+ * removing/reloading a definition restores its factory meaning immediately. */
+static const CommandHelp *canonical_lookup(const char *name)
 {
     size_t i;
-    for (i=0; i < COMMAND_INFO_COUNT; i++) {
-        const char *p = command_info[i].synonyms;
-        size_t n = strlen(name);
-        if (!strcasecmp(name,command_info[i].name)) return &command_info[i];
-        while (*p) {
-            const char *begin, *end;
-            while (*p == ' ' || *p == ',') p++;
-            begin = p;
-            while (*p && *p != ',') p++;
-            end = p;
-            while (end > begin && end[-1] == ' ') end--;
-            if ((size_t)(end-begin)==n && !strncasecmp(name,begin,n)) return &command_info[i];
-        }
+    for (i=0;i<COMMAND_INFO_COUNT;i++)
+        if (!strcasecmp(name,command_info[i].name)) return command_info+i;
+    return NULL;
+}
+static int user_command_index(const char *name);
+/* Iterate comma-separated factory aliases without allocating or modifying
+ * the registry. All callers use the same token boundaries. */
+static const char *next_synonym(const char **next, size_t *n)
+{
+    const char *p=*next, *begin, *end;
+    while (*p==' ' || *p==',') p++;
+    begin=p;
+    while (*p && *p!=',') p++;
+    end=p;
+    while (end>begin && end[-1]==' ') end--;
+    *next=p;
+    *n=(size_t)(end-begin);
+    return *n ? begin : NULL;
+}
+static const CommandHelp *factory_synonym_lookup(const char *name)
+{
+    size_t i,n,len=strlen(name);
+    for (i=0;i<COMMAND_INFO_COUNT;i++) {
+        const char *p=command_info[i].synonyms, *begin;
+        while ((begin=next_synonym(&p,&n))!=NULL)
+            if (n==len && !strncasecmp(name,begin,n)) return command_info+i;
     }
     return NULL;
+}
+static const CommandHelp *command_lookup(const char *name)
+{
+    const CommandHelp *info=canonical_lookup(name);
+    if (info) return info;
+    if (user_command_index(name)>=0) return NULL;
+    return factory_synonym_lookup(name);
+}
+/* A bounded token comparison avoids constructing temporary alias strings.
+ * The same active alias set drives help, search and completion. */
+static bool synonym_active(const char *name,size_t n)
+{
+    size_t i;
+    for (i=0;i<user_command_count;i++)
+        if (strlen(user_commands[i].name)==n &&
+            !strncasecmp(name,user_commands[i].name,n)) return false;
+    return true;
+}
+static void effective_synonyms(const CommandHelp *info,char *out,size_t cap)
+{
+    const char *p=info->synonyms,*begin;
+    size_t n,used=0;
+    if (!cap) return;
+    out[0]=0;
+    while ((begin=next_synonym(&p,&n))!=NULL) {
+        if (!synonym_active(begin,n)) continue;
+        if (n+(used?2:0)>=cap-used) break;
+        if (used) {out[used++]=',';out[used++]=' ';}
+        memcpy(out+used,begin,n);used+=n;out[used]=0;
+    }
 }
 /* Build read-only guidance without heap allocations. The current registry
  * fits comfortably; future growth is explicitly marked rather than silently
@@ -1988,13 +2312,15 @@ static bool contains_word(const char *haystack, const char *word, size_t n)
 /* All words must match; this is literal filtering, not a shell or regex. */
 static bool guide_matches(const CommandHelp *info, const char *query)
 {
+    char aliases[COMMAND_SIZE];
+    effective_synonyms(info,aliases,sizeof aliases);
     while (*query) {
         size_t n;
         while (*query == ' ' || *query == '\t') query++;
         n = strcspn(query, " \t");
         if (!n) break;
         if (!contains_word(info->name,query,n) &&
-            !contains_word(info->synonyms,query,n) &&
+            !contains_word(aliases,query,n) &&
             !contains_word(info->syntax,query,n) &&
             !contains_word(info->summary,query,n) &&
             !contains_word(info->description,query,n) &&
@@ -2006,6 +2332,7 @@ static bool guide_matches(const CommandHelp *info, const char *query)
 static void command_overview(const char *query, bool keep_draft)
 {
     size_t used = 0, i, section, count = 0;
+    bool user_heading=false;
     guide_append(&used,"COMMANDS BY TASK\n\n");
     if (*query) guide_append(&used,"Matching: %s\n\n",query);
     guide_append(&used,"Type the command, then Enter. [ ] means optional.\n"
@@ -2015,6 +2342,7 @@ static void command_overview(const char *query, bool keep_draft)
         for (i = 0; i < COMMAND_INFO_COUNT; i++) {
             const CommandHelp *info = command_info + i;
             if (info->section != section || !guide_matches(info,query)) continue;
+            if (no_cmd && external_command(info->name)) continue;
             if (!heading) { guide_append(&used,"\n%s\n",command_sections[section]); heading=true; }
             guide_append(&used,"  %s\n    %s\n",info->syntax,info->summary);
             count++;
@@ -2024,8 +2352,10 @@ static void command_overview(const char *query, bool keep_draft)
         if (!*query || contains_word(user_commands[i].name,query,strlen(query)) ||
             contains_word(user_commands[i].body,query,strlen(query)) ||
             !strcasecmp(query,"user") || !strcasecmp(query,"custom")) {
-            if (i==0) guide_append(&used,"\nUser commands\n");
-            guide_append(&used,"  %s\n    Runs: %s\n",user_commands[i].name,user_commands[i].body);
+            if (!user_heading) {guide_append(&used,"\nUser commands\n");user_heading=true;}
+            guide_append(&used,"  %s\n    %s: %s\n",user_commands[i].name,
+                         command_lookup(user_commands[i].name) ? "Shadowed definition (not run)" : "Runs",
+                         user_commands[i].body);
             count++;
         }
     if (!count) guide_append(&used,"\nNo matching commands. Try a shorter word,\n"
@@ -2037,15 +2367,19 @@ static void command_details(const CommandHelp *info, const char *problem,
                             bool keep_draft)
 {
     size_t used = 0;
+    char aliases[COMMAND_SIZE];
+    effective_synonyms(info,aliases,sizeof aliases);
     if (problem) guide_append(&used,"%s\n\nNothing ran. Esc/q returns to your command to correct it.\n\n",problem);
+    if (no_cmd && external_command(info->name))
+        guide_append(&used,"%s\n\n",cmd_disabled);
     guide_append(&used,"%s - %s\n\nEXAMPLES\n%s\n\nDETAILS\n%s\n\n"
                        "FORM\n%s\n[ ] means optional; do not type the brackets.\n\n"
                        "SYNONYMS\n%s\n\nEsc/q returns to Command>. Nothing here runs itself.\n",
                  info->name, info->summary, info->examples, info->description,
-                 info->syntax, *info->synonyms ? info->synonyms : "(none)");
+                 info->syntax, *aliases ? aliases : "(none)");
     guide_open(problem ? "Check this command" : "How to use this command",command_page,keep_draft);
 }
-/* Names are deliberately not shell names or filenames. Built-ins always win. */
+/* Only canonical names are reserved; custom definitions beat aliases. */
 static int user_command_index(const char *name)
 {
     size_t i;
@@ -2055,22 +2389,30 @@ static int user_command_index(const char *name)
 }
 static bool user_command_name(const char *name)
 {
-    size_t i, n=strlen(name);
-    if (!n || n>=USER_CMD_NAME || name[0]<'a' || name[0]>'z') return false;
+    size_t i,n=strlen(name);
+    if (!n || n>=USER_CMD_NAME || canonical_lookup(name)) return false;
+    /* Reclaim even the factory punctuation aliases, but do not introduce
+     * arbitrary punctuation into otherwise lowercase ASCII custom names. */
+    if (factory_synonym_lookup(name)) {
+        for (i=0;i<n;i++) if (name[i]>='A' && name[i]<='Z') return false;
+        return true;
+    }
+    if (name[0]<'a' || name[0]>'z') return false;
     for (i=1;i<n;i++) if (!((name[i]>='a' && name[i]<='z') ||
                                 (name[i]>='0' && name[i]<='9') ||
                                 name[i]=='_' || name[i]=='-')) return false;
-    return !command_lookup(name);
+    return true;
 }
 static void show_user_commands(bool keep_draft)
 {
     size_t i, used=0;
     guide_append(&used,"USER COMMANDS (%zu/%d)\n\n",user_command_count,USER_CMD_MAX);
     for(i=0;i<user_command_count;i++)
-        guide_append(&used,"  %s = %s\n",user_commands[i].name,user_commands[i].body);
+        guide_append(&used,"  %s = %s%s\n",user_commands[i].name,user_commands[i].body,
+                     command_lookup(user_commands[i].name) ? " (shadowed by built-in; rename or undefine)" : "");
     if (!user_command_count) guide_append(&used,"(none defined)\n");
     guide_append(&used,"\ndefine NAME COMMAND   Save a command with a custom name.\n"
-                       "undefine NAME         Remove the named command.\n"
+                       "undefine NAME         Remove the definition; restore any factory synonym.\n"
                        "NAME                  Run its definition explicitly.\n"
                        "run FILE              Execute a plaintext editor script.\n"
                        "No commands run automatically when a file is opened.\n");
@@ -2226,6 +2568,10 @@ static int hotkey_code(const char *key, char canonical[24])
     return code;
 }
 
+/* This is a binding admission check, not a full command parser. Ordinary
+ * built-in arguments are checked when execute() runs the binding. A custom
+ * name must already exist and take no arguments; its body is resolved at
+ * invocation time, so redefining it also changes what the binding runs. */
 static bool allowed_key_command(const char *command_text)
 {
     char word[32]; size_t n = 0;
@@ -2261,7 +2607,8 @@ static bool allowed_key_command(const char *command_text)
         /* Custom commands are argument-free. No invented key bindings. */
         return !*tail;
     }
-    /* No bind/unbind from inside another binding. */
+    /* Reject direct keymap-editing actions here. This is not a recursive
+     * restriction on bodies reached through user-command aliases. */
     return info && strcmp(info->name,"bind") && strcmp(info->name,"unbind");
 }
 
@@ -2276,6 +2623,9 @@ static const char *binding_action(int code)
     int i = binding_index(code);
     return i < 0 ? NULL : binds[i].action;
 }
+/* Update the live table only. Interactive bind/unbind deliberately keep the
+ * session change if save_bindings() later fails; definitions use a different
+ * save-before-apply policy in save_user_command_table(). */
 static bool binding_assign(const char *name, const char *action)
 {
     char normal[24]; int code = hotkey_code(name, normal), i;
@@ -2295,7 +2645,8 @@ static bool binding_assign(const char *name, const char *action)
 
 /* Configuration is inert text, not executable code. Readable settings are
  * fine (0755 directory / 0644 file); other users must not be able to write.
- * Keep path construction separate so even an unavailable path can be shown. */
+ * Keep path construction separate so even an unavailable path can be shown.
+ * leaf is a program-supplied filename; the returned path is caller-owned. */
 static char *config_filename(const char *leaf)
 {
     const char *base = getenv("XDG_CONFIG_HOME"), *suffix = "/editor/";
@@ -2344,7 +2695,9 @@ static char *keymap_path(bool create)
 
 /* Bounded, inert configuration. Refuse special files, links, NUL bytes,
  * foreign/writable-by-others files and files changing during the read.
- * 0 means absent, 1 loaded, -1 invalid/unavailable (with a useful errno). */
+ * 0 means absent, 1 loaded, -1 invalid/unavailable (with a useful errno).
+ * The caller owns b->s on every return, including a partially read failure.
+ * Only a 1 return supplies terminated contents and valid optional seen data. */
 static int read_config_file(const char *path, Buffer *b, struct stat *seen)
 {
     char chunk[1024];
@@ -2371,6 +2724,8 @@ static int read_config_file(const char *path, Buffer *b, struct stat *seen)
     }
     if (!reserve(b,b->n+1) || fstat(fd,&after)<0) goto done;
     if (!same_disk_version(&before,&after)) { errno=EAGAIN; goto done; }
+    if (lstat(path,&before)<0) goto done;
+    if (!same_disk_version(&before,&after)) { errno=EAGAIN; goto done; }
     b->s[b->n]=0;
     if (seen) *seen=after;
     result=1;
@@ -2391,7 +2746,7 @@ static int read_config(const char *leaf, Buffer *b)
 }
 
 typedef struct { const char *key, *value; size_t key_n, value_n; } ConfigField;
-typedef struct { bool movement, signals, esc_menu, mouse, warning; } ConfigSettings;
+typedef struct { bool movement, signals, esc_menu, mouse, wrap, warning; } ConfigSettings;
 /* Slice a line without changing its bytes. The writer can preserve comments,
  * spacing, unknown settings and LF/CRLF while replacing just the value. */
 static ConfigField config_field(const char *s, size_t n)
@@ -2416,9 +2771,13 @@ static bool config_word(const char *s, size_t n, const char *word)
 {
     return s && n==strlen(word) && !memcmp(s,word,n);
 }
+/* Start from defaults, then let each valid recognized value override the
+ * previous one. Unknown keys or invalid values set a warning without
+ * discarding other valid settings. The reader borrows b; it does not rewrite
+ * the text, which save_preference() needs to preserve unrelated entries. */
 static ConfigSettings parse_config(const Buffer *b)
 {
-    ConfigSettings settings={0};
+    ConfigSettings settings={.wrap=true};
     size_t at=0;
     while (at<b->n) {
         const char *line=b->s+at, *lf=memchr(line,'\n',b->n-at);
@@ -2435,6 +2794,8 @@ static ConfigSettings parse_config(const Buffer *b)
             else if (config_word(f.key,f.key_n,"esc") && config_word(f.value,f.value_n,"cli")) settings.esc_menu=false;
             else if (config_word(f.key,f.key_n,"mouse") && config_word(f.value,f.value_n,"on")) settings.mouse=true;
             else if (config_word(f.key,f.key_n,"mouse") && config_word(f.value,f.value_n,"off")) settings.mouse=false;
+            else if (config_word(f.key,f.key_n,"wrap") && config_word(f.value,f.value_n,"on")) settings.wrap=true;
+            else if (config_word(f.key,f.key_n,"wrap") && config_word(f.value,f.value_n,"off")) settings.wrap=false;
             else settings.warning=true;
         }
         at+=n;
@@ -2444,7 +2805,7 @@ static ConfigSettings parse_config(const Buffer *b)
 static ConfigSettings startup_settings(void)
 {
     Buffer b={0};
-    ConfigSettings settings={0};
+    ConfigSettings settings={.wrap=true};
     int result=read_config("config",&b);
     startup_config_error=result<0 ? errno : 0;
     if (result==1) settings=parse_config(&b);
@@ -2454,6 +2815,7 @@ static ConfigSettings startup_settings(void)
         startup_esc_menu=settings.esc_menu;
         startup_signals=settings.signals;
         startup_mouse=settings.mouse;
+        startup_wrap=settings.wrap;
     }
     free(b.s); return settings;
 }
@@ -2464,6 +2826,7 @@ static void load_startup_config(void)
     signal_controls=settings.signals;
     menu_preferred=settings.esc_menu;
     mouse_enabled=settings.mouse;
+    wrap_enabled=settings.wrap;
 }
 static bool config_append(Buffer *b, const char *s, size_t n)
 {
@@ -2473,7 +2836,7 @@ static bool config_append(Buffer *b, const char *s, size_t n)
     b->n+=n; b->s[b->n]=0; return true;
 }
 enum { SETTING_STARTUP, SETTING_ESC, SETTING_SIGNALS, SETTING_MOUSE,
-       SETTING_CLIPHISTORY, SETTING_COUNT };
+       SETTING_CLIPHISTORY, SETTING_WRAP, SETTING_COUNT };
 /* One registry identifies every persistent switch. Menus use the same
  * commands as typed input; toggles never accept an on/off sub-language. */
 typedef struct {
@@ -2484,7 +2847,8 @@ static const SettingToggle setting_toggles[SETTING_COUNT] = {
     { "toggle-esc", "Esc", "esc", "menu", "cli" },
     { "toggle-signals", "Signal handling", "signal_controls", "on", "off" },
     { "toggle-mouse", "Mouse", "mouse", "on", "off" },
-    { "toggle-cliphistory", "Clipboard history", NULL, "on", "off" }
+    { "toggle-cliphistory", "Clipboard history", NULL, "on", "off" },
+    { "toggle-wrap", "Word wrap", "wrap", "on", "off" }
 };
 static int setting_toggle_index(const char *command_name)
 {
@@ -2500,14 +2864,16 @@ static bool setting_enabled(int kind)
     case SETTING_ESC: return menu_preferred;
     case SETTING_SIGNALS: return signal_controls!=0;
     case SETTING_MOUSE: return mouse_enabled;
+    case SETTING_WRAP: return wrap_enabled;
     case SETTING_CLIPHISTORY: return clip_history_enabled;
     default: return false;
     }
 }
-/* Change one preference, not the document or the rest of the config. Startup
- * toggles the fresh on-disk value. Esc and signal callers supply the
- * opposite of their live setting. Do not change live behavior until the
- * replacement succeeds. This one writer preserves other settings/comments. */
+/* Change one preference, not the document or the rest of the config. A
+ * negative choice toggles the freshly read disk value; 0/1 requests an
+ * explicit value. Startup uses the former, while live toggles use the latter.
+ * Only update saved-value globals after publication (or a byte-identical
+ * no-op); toggle_setting() applies live behavior after success. */
 static bool save_preference(int kind, int choice)
 {
     char *path=NULL, *tmp=NULL, *dir=NULL, *slash;
@@ -2533,7 +2899,8 @@ static bool save_preference(int kind, int choice)
     settings=parse_config(&old);
     previous=kind==SETTING_STARTUP ? settings.movement :
              kind==SETTING_ESC ? settings.esc_menu :
-             kind==SETTING_SIGNALS ? settings.signals : settings.mouse;
+             kind==SETTING_SIGNALS ? settings.signals :
+             kind==SETTING_WRAP ? settings.wrap : settings.mouse;
     mode=choice<0 ? !previous : choice!=0;
     value=mode ? on : off;
     while (at<old.n) {
@@ -2541,6 +2908,8 @@ static bool save_preference(int kind, int choice)
         size_t n=lf ? (size_t)(lf-line)+1 : old.n-at;
         ConfigField f=config_field(line,n);
         if (!at && lf && lf>line && lf[-1]=='\r') ending="\r\n";
+        /* Rewrite every occurrence of this key. Leaving a later duplicate
+         * untouched could override the requested value on the next load. */
         if (f.value && config_word(f.key,f.key_n,key)) {
             size_t prefix=(size_t)(f.value-line);
             if (!config_append(&out,line,prefix) ||
@@ -2592,6 +2961,7 @@ committed:
     startup_esc_menu=settings.esc_menu;
     startup_signals=settings.signals;
     startup_mouse=settings.mouse;
+    startup_wrap=settings.wrap;
     startup_config_warning=settings.warning;
     startup_config_error=0;
 done:
@@ -2616,33 +2986,38 @@ static void show_settings(void)
     if (startup_config_error)
         guide_append(&used,"Cannot read saved settings: %s.\nUse a directory owned by you, not writable by other users.\n\n",
                      strerror(startup_config_error));
-    else guide_append(&used,"Saved startup: %s\nSaved Esc interface: %s\nSaved signal handling: %s\nSaved mouse: %s\n\n",
+    else guide_append(&used,"Saved startup: %s\nSaved Esc interface: %s\nSaved signal handling: %s\nSaved mouse: %s\nSaved word wrap: %s\n\n",
                       startup_movement ? "movement" : "edit",
                       startup_esc_menu ? "Menu" : "Command line",
                       startup_signals ? "ON (interrupt cancels)" : "OFF (interrupt exits)",
-                      startup_mouse ? "On" : "Off");
-    guide_append(&used,"Current mode: %s\nCurrent Esc interface: %s\nCurrent signal handling: %s\nCurrent mouse: %s\nClipboard history: %s\n\n"
+                      startup_mouse ? "On" : "Off", startup_wrap ? "On" : "Off");
+    guide_append(&used,"Current mode: %s\nCurrent Esc interface: %s\nCurrent signal handling: %s\nCurrent mouse: %s\nCurrent word wrap: %s\nClipboard history: %s\n\n"
                  "Every toggle switches one choice and saves it. No arguments.\n"
                  "toggle-startup      Next launch: Edit / Movement.\n"
                  "toggle-esc          Esc opens: Command line / Menu.\n"
                  "toggle-mouse        Mouse: Off / On.\n"
+                 "toggle-wrap         Word wrap: On / Off (display only).\n"
                  "toggle-signals      Interrupt: exits / cancels input.\n"
                  "toggle-cliphistory  Keep clipboard history: Off / On.\n\n"
                  "Only toggle-startup waits for the next launch. The others apply now.\n"
                  "movement / edit changes the CURRENT mode, without saving.\n"
-                 "--movement/--edit, --menu/--cli and --mouse/--no-mouse override one launch.\n"
+                 "--movement/--edit, --menu/--cli, --mouse/--no-mouse and --wrap/--no-wrap override one launch.\n"
                  "Clipboard history is saved with clipboard data; existing snapshots remain when off.\n"
                  "Ctrl+C/Z are never bound. With signals off, Ctrl+C exits WITHOUT SAVING.\n"
                  "Ctrl+Z suspends either way.\n"
                  "settings opens Help > Settings. Esc/q returns to Command>.\n",
                  movement_mode ? "movement" : "edit", menu_preferred ? "Menu" : "Command line",
                  signal_controls ? "ON (interrupt cancels)" : "OFF (interrupt exits)",
-                 mouse_enabled ? "On" : "Off",clip_history_enabled ? "On" : "Off");
+                 mouse_enabled ? "On" : "Off",wrap_enabled ? "On" : "Off",clip_history_enabled ? "On" : "Off");
     if (startup_config_warning && !startup_config_error)
         guide_append(&used,"\nSome unrecognized/invalid config entries were ignored.\n");
     free(path); guide_open("Settings",command_page,false);
 }
 
+/* bindings_loaded means the disk file was fully understood, or was absent.
+ * It gates future saves. bindings_version_valid records a successful read of
+ * an existing file, even if parsing later rejects an entry. --no-keys leaves
+ * both false so a deliberately skipped map cannot be replaced. */
 static void load_bindings(void)
 {
     Buffer b = {0};
@@ -2693,6 +3068,9 @@ static void load_bindings(void)
     free(b.s);
 }
 
+/* Match the writer's exact representation, not merely an equivalent parsed
+ * map. Keep this and save_bindings() together when changing serialization:
+ * post-publish metadata must not bless another writer's different bytes. */
 static bool bindings_bytes_match(const Buffer *b)
 {
     static const char header[] = "# editor user-defined keys; no built-in hotkeys\n";
@@ -2708,6 +3086,11 @@ static bool bindings_bytes_match(const Buffer *b)
     return at == b->n;
 }
 
+/* Publish the current session map against the version observed at load/save.
+ * Version checks detect intervening changes; they are not a file lock.
+ * A false return leaves the live bindings in place. After link/rename succeeds
+ * the new file is committed, even if later verification or directory sync
+ * cannot complete; those failures must not claim the assignment was unsaved. */
 static bool save_bindings(void)
 {
     char *path = NULL, *tmp = NULL, *dir = NULL, *slash;
@@ -2823,14 +3206,17 @@ static void show_bindings(void)
     open_viewer("Bindings", binds_page);
 }
 
+/* The hash is a compact lookup key, not a document identity: journal_load
+ * also compares the stored full pathname. Return an owned path, creating
+ * private history storage as needed, or NULL when persistence is unavailable. */
 static char *journal_path(const char *path)
 {
     const char *base = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
     char *root, *work, *result, *p;
     size_t n;
-    if (!path) return NULL;
+    if (!path) { errno = EINVAL; return NULL; }
     if (!base || *base != '/') {
-        if (!home || *home != '/') return NULL;
+        if (!home || *home != '/') { errno = EINVAL; return NULL; }
         n = strlen(home) + sizeof "/.local/state";
         root = malloc(n);
         if (!root) return NULL;
@@ -2852,8 +3238,11 @@ static char *journal_path(const char *path)
     if (!private_directory(work)) { free(root); free(work); return NULL; }
     {
         struct stat st;
-        if (lstat(work, &st) < 0 || st.st_uid != geteuid() || (st.st_mode & 077)) {
-            free(root); free(work); return NULL;
+        if (lstat(work, &st) < 0) {
+            int error = errno; free(root); free(work); errno = error; return NULL;
+        }
+        if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077)) {
+            free(root); free(work); errno = EACCES; return NULL;
         }
     }
     n = strlen(work) + 1 + 16 + sizeof ".undo";
@@ -2869,6 +3258,15 @@ static size_t redo_depth(void)
 {
     return history_tail ? history_tail->ordinal - undo_depth() : 0;
 }
+/* Caller has installed text/saved and cleared the previous document's history
+ * and journal state. Parse into local allocations, then transfer ownership
+ * only after validation; rejecting a journal must not change document bytes.
+ *
+ * Disk layout: 8-byte EDUNDO01/02 magic; four little-endian u64 fields
+ * (path length, snapshot length, change count, current index); pathname and
+ * snapshot bytes; then five u64 fields per change (at, before, after, old_n,
+ * new_n) followed by its old/new bytes. UINT64_MAX means no applied change;
+ * other indices are zero-based. Version 2 ends with an 8-byte checksum. */
 static void journal_load(void)
 {
     char *path = journal_path(filename), *stored_path = NULL;
@@ -2942,11 +3340,46 @@ static void journal_load(void)
     { char extra; if (read(fd, &extra, 1) != 0) goto done; }
     if (fstat(fd, &after) < 0 || !same_disk_version(&st, &after)) goto done;
     {
+        struct stat named;
+        if (lstat(path, &named) < 0 || !same_disk_version(&after, &named)) goto done;
+    }
+    {
         bool outside = state.n != saved.n ||
                        (state.n && memcmp(state.s, saved.s, state.n));
         Change *place = position == UINT64_MAX ? NULL : head;
         Change *external = NULL;
         if (place) for (i = 0; i < position; i++) place = place->next;
+        /* Check all reconstructed lengths and cursor offsets before making
+         * a journal live. A damaged journal must not leave an impossible
+         * history state waiting to crash during later navigation. These are
+         * O(transaction count) checks, without replaying large file buffers.
+         * history_step() checks each edge's expected bytes when it is used;
+         * structural validation here does not replace that content check. */
+        {
+            Change *q;
+            size_t length = state.n, oldest_length;
+            for (q = place; q; q = q->prev) {
+                size_t previous;
+                if (q->at > length || q->new_n > length - q->at ||
+                    q->old_n > LIMIT - (length - q->new_n) ||
+                    q->after > length) goto done;
+                previous = length - q->new_n + q->old_n;
+                if (q->before > previous) goto done;
+                length = previous;
+            }
+            oldest_length = length;
+            for (q = head; q; q = q->next) {
+                size_t following;
+                if (q->at > length || q->old_n > length - q->at ||
+                    q->new_n > LIMIT - (length - q->old_n) ||
+                    q->before > length) goto done;
+                following = length - q->old_n + q->new_n;
+                if (q->after > following) goto done;
+                length = following;
+                if (q == place && length != state.n) goto done;
+            }
+            if (!place && oldest_length != state.n) goto done;
+        }
         if (outside) {
             /* No existing file to compare with means a removed/recreated path,
              * not a safely identified external content change. */
@@ -2989,35 +3422,6 @@ static void journal_load(void)
             place = external;
             journal_rebased = true;
         }
-        /* Check all reconstructed lengths and cursor offsets before making
-         * a journal live. A damaged journal must not leave an impossible
-         * history state waiting to crash during later navigation. These are
-         * O(transaction count) checks, without replaying large file buffers. */
-        {
-            Change *q;
-            size_t length = journal_rebased ? saved.n : state.n, oldest_length;
-            for (q = place; q; q = q->prev) {
-                size_t previous;
-                if (q->at > length || q->new_n > length - q->at ||
-                    q->old_n > LIMIT - (length - q->new_n) ||
-                    q->after > length) goto done;
-                previous = length - q->new_n + q->old_n;
-                if (q->before > previous) goto done;
-                length = previous;
-            }
-            oldest_length = length;
-            for (q = head; q; q = q->next) {
-                size_t following;
-                if (q->at > length || q->old_n > length - q->at ||
-                    q->new_n > LIMIT - (length - q->old_n) ||
-                    q->before > length) goto done;
-                following = length - q->old_n + q->new_n;
-                if (q->after > following) goto done;
-                length = following;
-                if (q == place && length != (journal_rebased ? saved.n : state.n)) goto done;
-            }
-            if (!place && oldest_length != (journal_rebased ? saved.n : state.n)) goto done;
-        }
         history = head; head = NULL;
         current = place;
         history_tail = tail;
@@ -3037,6 +3441,11 @@ done:
         journal_rebased = journal_branched = false;
     }
 }
+/* Save the current text snapshot plus applied and redo history. Callers must
+ * first establish that text has been saved; this routine cannot prove that.
+ * Failure preserves the in-memory chain. Success requires publication,
+ * synchronization of the containing directory and a final identity check.
+ * A failure after publication is a warning, not a rollback. */
 static bool journal_save(void)
 {
     char *path = journal_path(filename), *tmp = NULL, *dir = NULL, *slash;
@@ -3048,18 +3457,21 @@ static bool journal_save(void)
     JournalOutput out = {0};
     int fd = -1, dir_fd = -1, old_fd = -1;
     struct stat st, written, check;
-    bool ok = false, old_present = false, temporary_created = false;
-    if (!path) return false;
+    bool ok = false, old_present = false, temporary_created = false, published = false;
+    if (!path) { if (history) journal_dirty = true; return false; }
     path_n = strlen(filename);
-    if (path_n > 16384 || text.n > LIMIT) goto done;
+    if (path_n > 16384) { errno = ENAMETOOLONG; goto done; }
+    if (text.n > LIMIT) { errno = EFBIG; goto done; }
     for (p = history; p; p = p->next) {
         if (p == current) current_position = (uint64_t)count;
         if (++count > JOURNAL_CHANGE_LIMIT || bytes > JOURNAL_LIMIT - 40 ||
             p->old_n > JOURNAL_LIMIT - bytes - 40 ||
-            p->new_n > JOURNAL_LIMIT - bytes - p->old_n - 40) goto done;
+            p->new_n > JOURNAL_LIMIT - bytes - p->old_n - 40) {
+            errno = EFBIG; goto done;
+        }
         bytes += 40 + p->old_n + p->new_n;
     }
-    if (bytes > JOURNAL_LIMIT - text.n - path_n - 48) goto done;
+    if (bytes > JOURNAL_LIMIT - text.n - path_n - 48) { errno = EFBIG; goto done; }
     /* Preserve an old, incompatible journal rather than destroying past work. */
     old_fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
     if (old_fd >= 0) {
@@ -3133,24 +3545,31 @@ static bool journal_save(void)
         if (link(tmp, path) < 0) goto done;
         (void)unlink(tmp);
     }
-    /* Successful replacement leaves the old journal reachable through stale. */
+    /* Keep any stale link after publication. Before this point, failure
+     * cleanup removes only the archive link created by this invocation. */
     archived_linked = false;
+    published = true;
     free(loaded_journal_path);
     loaded_journal_path = strdup(path);
     loaded_journal_stat_valid = loaded_journal_path && lstat(path, &check) == 0 &&
         check.st_dev == written.st_dev && check.st_ino == written.st_ino &&
-        check.st_size == written.st_size &&
+        check.st_size == written.st_size && check.st_mode == written.st_mode &&
+        check.st_uid == written.st_uid && check.st_gid == written.st_gid &&
+        check.st_nlink == 1 &&
         check.st_mtim.tv_sec == written.st_mtim.tv_sec &&
         check.st_mtim.tv_nsec == written.st_mtim.tv_nsec;
-    if (loaded_journal_stat_valid) loaded_journal_stat = check;
+    if (!loaded_journal_stat_valid) { errno = EAGAIN; goto done; }
+    loaded_journal_stat = check;
     slash = strrchr(path, '/');
-    if (slash) {
-        dir = strdup(path);
-        if (dir) {
-            dir[slash - path] = 0;
-            dir_fd = open(dir, O_RDONLY);
-            if (dir_fd >= 0) (void)sync_fd(dir_fd);
-        }
+    if (!slash) { errno = EINVAL; goto done; }
+    dir = strdup(path);
+    if (!dir) goto done;
+    dir[slash - path] = 0;
+    dir_fd = open(*dir ? dir : "/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dir_fd < 0 || sync_fd(dir_fd) < 0) goto done;
+    /* The journal may have been replaced during directory sync. */
+    if (lstat(path, &check) < 0 || !same_disk_version(&loaded_journal_stat, &check)) {
+        errno = EAGAIN; goto done;
     }
     journal_dirty = false;
     journal_branched = false;
@@ -3161,7 +3580,11 @@ done:
       if (dir_fd >= 0) close(dir_fd);
       if (old_fd >= 0) close(old_fd);
       if (fd >= 0) close(fd);
-      if (!ok && temporary_created) (void)unlink(tmp);
+      if (!published && temporary_created) (void)unlink(tmp);
+      if (!ok) {
+          if (published) loaded_journal_stat_valid = false;
+          if (history) journal_dirty = true;
+      }
       if (archived_linked) (void)unlink(archived);
       errno = error;
     }
@@ -3169,6 +3592,8 @@ done:
     return ok;
 }
 
+/* Stream output cannot be rolled back: a failed write may already have sent
+ * a prefix to the consumer, although the editing buffer remains intact. */
 static void save_to_stdout(void)
 {
     if (isatty(STDOUT_FILENO)) {
@@ -3194,6 +3619,10 @@ static char *state_path(const char *leaf, bool create);
 static char *clipboard_path(bool create);
 static bool clipboard_archive(const Buffer *before);
 static void clipboard_return(void);
+/* Stage contents and recovery history before publishing a destination name.
+ * The link/rename below is the commit point. Earlier failures retain the
+ * editing state; later journal/archive/directory-sync failures are warnings
+ * about a completed save and must not be described as an unwritten document. */
 static void save_file(const char *name, bool approved)
 {
     char *path = NULL, *temporary = NULL, *slash;
@@ -3244,18 +3673,32 @@ static void save_file(const char *name, bool approved)
         /* clipboard.txt is a private scratch buffer, not a normal edited
          * document. Auto-save may replace a newer clipboard without asking.
          * Ordinary files keep the full overwrite-confirmation behavior. */
-        if (outside && !editing_clipboard &&
-            (!approved || !disk_matches(&conflict_snapshot, &conflict_stat, &disk, &st))) {
-            ask_overwrite(&disk, &st, path, other_file); goto done;
-        }
         if (!outside && !changed()) {
-            if (journal_dirty && history && !journal_save())
-                tell("Unchanged; undo history could not be persisted.");
+            if (journal_dirty && history && !journal_save()) {
+                if (errno == EFBIG)
+                    tell("Unchanged; undo journal limit reached. Live history retained.");
+                else tell("Unchanged; undo history could not be persisted.");
+            }
             else {
                 tell("Already saved (unchanged).");
                 clipboard_written = editing_clipboard;
             }
             goto done;
+        }
+        /* Rename uses directory permissions, so verify file write access
+         * before prompting or allocating undo steps. Do not truncate. */
+        if (!(st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) {
+            tell("File is not writable. Use write FILE for a new path."); goto done;
+        }
+        permission_fd = open(path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW);
+        if (permission_fd < 0) goto failure;
+        if (fstat(permission_fd, &check) < 0) goto failure;
+        if (!same_disk_version(&check, &st)) {
+            tell("File changed during write preparation. Try write again."); goto done;
+        }
+        if (outside && !editing_clipboard &&
+            (!approved || !disk_matches(&conflict_snapshot, &conflict_stat, &disk, &st))) {
+            ask_overwrite(&disk, &st, path, other_file); goto done;
         }
         /* Allocate the external-content recovery steps before committing.
          * If insufficient memory, leave the outside writer's data untouched. */
@@ -3267,12 +3710,6 @@ static void save_file(const char *name, bool approved)
                 tell("Cannot preserve external changes in undo. Write cancelled."); goto done;
             }
         }
-        permission_fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
-        if (permission_fd < 0) goto failure;
-        if (fstat(permission_fd, &check) < 0) goto failure;
-        if (!same_disk_version(&check, &st)) {
-            tell("File changed during write preparation. Try write again."); goto done;
-        }
         mode = editing_clipboard ? 0600 : st.st_mode & 0777;
     } else {
         if (same && existed && !editing_clipboard) {
@@ -3281,6 +3718,8 @@ static void save_file(const char *name, bool approved)
         mask = umask(0); umask(mask);
         mode = editing_clipboard ? 0600 : 0666 & ~mask;
     }
+    /* Preallocate the new saved baseline too: after publication, recording
+     * that the document was written must not depend on another allocation. */
     if (!copy_buffer(&snapshot, text.s, text.n)) { errno = ENOMEM; goto failure; }
     /* Only the canonical parent and template are needed, not a copy of
      * the old basename. Keep slash pointing into the owned allocation. */
@@ -3297,18 +3736,22 @@ static void save_file(const char *name, bool approved)
     }
     fd = mkstemp(temporary);
     if (fd < 0) goto failure;
+    /* Only a successful mkstemp gives cleanup ownership of this pathname. */
     temporary_created = true;
     if (fstat(fd, &written) < 0) goto failure;
     if (present && (written.st_uid != st.st_uid || written.st_gid != st.st_gid) &&
         fchown(fd, st.st_uid, st.st_gid) < 0) goto failure;
+    /* Set mode after ownership, which can clear permission bits. mode omits
+     * set-ID/sticky bits: a new contents inode must not acquire old privileges. */
     if (fchmod(fd, mode) < 0 || write_all(fd, text.s, text.n) < 0 || sync_fd(fd) < 0)
         goto failure;
     if (fstat(fd, &written) < 0) goto failure;
     if (close(fd) < 0) { fd = -1; goto failure; }
     fd = -1;
     if (present) {
-        /* Re-read after preparing the temporary file. A later outside write
-         * requires a new approval, never the old one. */
+        /* Re-read after staging and request new approval for detected outside
+         * changes. This is optimistic conflict detection, not a filesystem
+         * lock; another writer can still race the final check and rename. */
         if (!read_file(path, &again, &check)) goto failure;
         if (!disk_matches(&disk, &st, &again, &check)) {
             if (editing_clipboard)
@@ -3324,6 +3767,8 @@ static void save_file(const char *name, bool approved)
         if (io_cancelled() || link(temporary, path) < 0) goto failure;
         (void)unlink(temporary);
     }
+    /* Disk publication succeeded. Transfer preallocated ownership now, even
+     * if a later signal or durability/history check reports a warning. */
     committed = true;
     free(filename); filename = path; path = NULL;
     free(saved.s); saved = snapshot; memset(&snapshot, 0, sizeof snapshot);
@@ -3345,7 +3790,9 @@ static void save_file(const char *name, bool approved)
     } else tell("Written.");
     if (!journal_save()) {
         warn_history = true;
-        tell("Written; undo history could not be persisted.");
+        if (errno == EFBIG)
+            tell("Written; undo journal limit reached. Live history retained.");
+        else tell("Written; undo history could not be persisted.");
     }
     if (clip_history_enabled && present && !same_bytes(&disk,&text)) {
         char *clip_path=clipboard_path(false);
@@ -3384,6 +3831,8 @@ done:
     }
 }
 
+/* Discard only the last rendered rows. A resize, terminal handoff, or failed
+ * output invalidates this cache; document bytes and undo history live elsewhere. */
 static void reset_screen(void)
 {
     int i;
@@ -3400,6 +3849,9 @@ static void mouse_tracking(bool enable)
                         enable ? sizeof on - 1 : sizeof off - 1);
 }
 
+/* Rebuild terminal settings from the caller's original snapshot on every
+ * start/resume, rather than layering changes onto our previous raw settings.
+ * terminal_restore() is the matching cleanup, including partial setup. */
 static void terminal_start(void)
 {
     struct termios raw = initial_termios;
@@ -3438,6 +3890,8 @@ static void terminal_start(void)
     if (terminated || suspended || interrupted) terminal_restore();
 }
 
+/* Handlers record intent only. Terminal restoration, allocation, prompts,
+ * process suspension, and document cleanup belong to normal control flow. */
 static void signal_handler(int sig)
 {
     if (sig == SIGWINCH) resized = 1;
@@ -3454,6 +3908,7 @@ static void install_handler(int sig, void (*handler)(int))
 {
     struct sigaction action;
     memset(&action, 0, sizeof action);
+    /* Leave SA_RESTART unset so interrupted I/O can reach the flag checks. */
     action.sa_handler = handler; sigemptyset(&action.sa_mask);
     if (sigaction(sig, &action, NULL) < 0) die(strerror(errno));
 }
@@ -3461,15 +3916,19 @@ static void install_handler(int sig, void (*handler)(int))
 static void dimensions(void)
 {
     struct winsize ws;
+    resized = 0; /* A signal during this query must remain pending. */
     if (ioctl(tty_out, TIOCGWINSZ, &ws) == 0) {
         rows = ws.ws_row ? ws.ws_row : 24;
         cols = ws.ws_col ? ws.ws_col : 80;
     }
     if (rows > 1000) rows = 1000;
     if (cols > 4096) cols = 4096;
-    reset_screen(); resized = 0;
+    reset_screen();
 }
 
+/* p is a byte offset and x its display column; callers may start at a cached
+ * position to skip an off-screen prefix. from/width are terminal cells, not
+ * bytes. A partly clipped wide character becomes spaces, never half a glyph. */
 static void visible_from(Buffer *b, const char *s, size_t n, size_t from,
                          size_t width, size_t p, size_t x)
 {
@@ -3523,19 +3982,31 @@ static void visible_match(Buffer *b, const char *s, size_t n, size_t from,
     if (active) output(b,"\033[0m");
 }
 
+/* Cache the complete row rendition, including attributes and erase-to-end.
+ * Take ownership of row_text only when it replaces a cached row. The caller
+ * must invalidate the cache if the assembled frame cannot be sent in full. */
 static void draw_row(Buffer *out, int row, Buffer *line, bool reverse)
 {
     Buffer row_text = {0};
     char address[48];
-    output(&row_text, reverse ? "\033[7m" : "\033[0m");
+    const char *prefix = reverse ? "\033[7m" : "\033[0m";
+    static const char suffix[] = "\033[0m\033[K";
+    const char *previous = previous_rows[row];
+    const size_t prefix_n = 4, suffix_n = sizeof suffix - 1;
+    /* Compare the existing rendering before allocating a new row. Most
+     * rows are unchanged during cursor movement and command entry. */
+    if (drawing_failed) return;
+    if (previous && strlen(previous) == prefix_n + line->n + suffix_n &&
+        !memcmp(previous, prefix, prefix_n) &&
+        (!line->n || !memcmp(previous + prefix_n, line->s, line->n)) &&
+        !memcmp(previous + prefix_n + line->n, suffix, suffix_n)) return;
+    output(&row_text, prefix);
     if (line->n) add(&row_text, line->s, line->n);
-    output(&row_text, "\033[0m\033[K");
+    output(&row_text, suffix);
     if (drawing_failed) { free(row_text.s); return; }
-    if (!previous_rows[row] || strcmp(previous_rows[row], row_text.s)) {
-        snprintf(address, sizeof address, "\033[%d;1H", row + 1);
-        output(out, address); add(out, row_text.s, row_text.n);
-        free(previous_rows[row]); previous_rows[row] = row_text.s;
-    } else free(row_text.s);
+    snprintf(address, sizeof address, "\033[%d;1H", row + 1);
+    output(out, address); add(out, row_text.s, row_text.n);
+    free(previous_rows[row]); previous_rows[row] = row_text.s;
 }
 
 /* Wrap read-only pages in terminal columns. Besides the ASCII manual,
@@ -3694,7 +4165,8 @@ static const MenuItem menu_help_items[] = {
     ITEM("User commands", "functions"),
     ASK("Define command...", "define", "NAME command> "),
     ASK("Remove command...", "undefine", "User name> "),
-    ASK("Run script...", "run", "Script file> ")
+    ASK("Run script...", "run", "Script file> "),
+    ITEM("Word wrap", "toggle-wrap")
 };
 static const MenuItem menu_settings_items[] = {
     ITEM("Start in", "toggle-startup"),
@@ -3702,6 +4174,7 @@ static const MenuItem menu_settings_items[] = {
     ITEM("Mouse", "toggle-mouse"),
     ITEM("Signal handling", "toggle-signals"),
     ITEM("Clipboard history", "toggle-cliphistory"),
+    ITEM("Word wrap", "toggle-wrap"),
     GROUP("User hotkeys >", MENU_KEYS),
     ITEM("Settings explained", "help settings"),
     ITEM("Current / saved settings", "settings show")
@@ -3733,7 +4206,11 @@ static const MenuItem *menu_entries(size_t *count, const char **title)
             *title="Files";
         }
         break;
-    case MENU_EDIT: entry = menu_edit_items; *count = sizeof menu_edit_items / sizeof *entry; *title="Edit"; break;
+    case MENU_EDIT:
+        entry = menu_edit_items; *count = sizeof menu_edit_items / sizeof *entry;
+        /* The three external-command entries are the final items. */
+        if (no_cmd) *count -= 3;
+        *title="Edit"; break;
     case MENU_MOVE: entry = menu_move_items; *count = sizeof menu_move_items / sizeof *entry; *title="Move"; break;
     case MENU_HISTORY: entry = menu_history_items; *count = sizeof menu_history_items / sizeof *entry; *title="History"; break;
     case MENU_CONTROL: entry = menu_control_items; *count = sizeof menu_control_items / sizeof *entry; *title="Controls"; break;
@@ -3809,6 +4286,9 @@ static void draw_menu(Buffer *out, Buffer *line, int body)
         else if (entries[i].command && !strcmp(entries[i].command, "toggle-mouse"))
             name = cols<27 ? (mouse_enabled ? "Mouse On" : "Mouse Off") :
                    (mouse_enabled ? "Mouse: On" : "Mouse: Off");
+        else if (entries[i].command && !strcmp(entries[i].command, "toggle-wrap"))
+            name = cols<27 ? (wrap_enabled ? "Wrap On" : "Wrap Off") :
+                   (wrap_enabled ? "Word wrap: On" : "Word wrap: Off");
         else if (entries[i].command && !strcmp(entries[i].command, "toggle-signals"))
             name = cols<27 ? (signal_controls ? "Sig:On" : "Sig:Off") :
                    (signal_controls ? "Signals: On (cancel)" : "Signals: Off (exit)");
@@ -3825,6 +4305,9 @@ static void draw_menu(Buffer *out, Buffer *line, int body)
     while (row<body) { line->n=0; draw_row(out,row++,line,false); }
 }
 
+/* Assemble a frame before writing it, and send only rows whose rendition
+ * changed. Most surfaces leave the final terminal column unused to avoid
+ * implicit wrapping. Drawing may adjust the viewport, never document bytes. */
 static void draw(void)
 {
     Buffer out = {0}, line = {0}, status = {0};
@@ -3872,7 +4355,7 @@ static void draw(void)
         else if (menu_number>=0) {
             snprintf(info,sizeof info,"Choice %d: Enter",menu_number);
             hint=info;
-        } else if (menu_page==MENU_SETTINGS && menu_selection<5)
+        } else if (menu_page==MENU_SETTINGS && menu_selection<6)
             hint=cols<27 ? "Enter: toggle & save" : "Enter toggles and saves | h/Esc back";
         else if (editing_clipboard) hint="Write saves | clipboard returns";
         else hint=cols<27 ? "j/k l h" : "j/k move | l/Enter select | h/Esc back";
@@ -3881,47 +4364,86 @@ static void draw(void)
         output(&out,"\033[?25l");
         goto finish;
     }
-    start = line_start(cursor);
-    if (top > start) top = start;
-    p = top;
-    for (r = 0; r < body && p < start; r++) p = next_line(p);
-    if (r >= body) {
-        top = start;
-        for (r = 1; r < body && top; r++) top = line_start(top - 1);
-    }
-    col = column_at(start, cursor);
-    if (col < left) left = col;
-    if (col >= left + (size_t)(cols - 1)) left = col - (size_t)(cols - 2);
-    p = top;
-    for (r = 0; r < body; r++) {
-        size_t screen_p,screen_x;
-        if (p == start) cursor_row = r;
-        end = line_end(p);
-        screen_p=p;screen_x=0;
-        if (left) {
-            screen_p=position_at(p,left);
-            screen_x=column_at(p,screen_p);
+    if (wrap_enabled) {
+        WrapRow row;
+        size_t match_end;
+        width=current_wrap_width();
+        start=wrap_at(cursor); top=wrap_at(top); left=0;
+        if (top>start) top=start;
+        p=top;
+        for (r=0;r<body && p<start;r++) {
+            row=wrap_row(p);
+            if (row.next==SIZE_MAX) break;
+            p=row.next;
         }
-        if (search_mark!=SIZE_MAX && search_length && search_mark>=p &&
-            search_mark<end && search_length<=text.n-search_mark &&
-            !memcmp(text.s+search_mark,search_pattern,search_length))
-            visible_match(&line,text.s+p,end-p,left,(size_t)(cols-1),
-                          search_mark-p,search_mark-p+search_length,
-                          screen_p-p,screen_x);
-        else visible_from(&line,text.s ? text.s+p : "",end-p,left,
-                          (size_t)(cols-1),screen_p-p,screen_x);
-        draw_row(&out, r, &line, false);
-        if (end < text.n) p = next_line(p);
-        else {
-            r++;
-            for (; r < body; r++) { line.n = 0; draw_row(&out, r, &line, false); }
-            break;
+        if (r>=body) {
+            top=start;
+            for (r=1;r<body && top;r++) top=wrap_at(top-1);
+        }
+        col=wrap_column(start,cursor);
+        if (col>width) col=width;
+        p=top;
+        for (r=0;r<body;r++) {
+            row=wrap_row(p);
+            if (p==start) cursor_row=r;
+            match_end=search_mark<=text.n && search_length<=text.n-search_mark ?
+                      search_mark+search_length : 0;
+            if (match_end>p && search_mark<row.end && search_length &&
+                !memcmp(text.s+search_mark,search_pattern,search_length))
+                visible_match(&line,text.s+p,row.end-p,0,width,
+                              search_mark>p ? search_mark-p : 0,match_end-p,0,0);
+            else visible(&line,text.s ? text.s+p : "",row.end-p,0,width);
+            draw_row(&out,r,&line,false);
+            if (row.next==SIZE_MAX) {
+                for (++r;r<body;r++) {line.n=0;draw_row(&out,r,&line,false);}
+                break;
+            }
+            p=row.next;
+        }
+    } else {
+        start = line_start(cursor);
+        top = line_start(top);
+        if (top > start) top = start;
+        p = top;
+        for (r = 0; r < body && p < start; r++) p = next_line(p);
+        if (r >= body) {
+            top = start;
+            for (r = 1; r < body && top; r++) top = line_start(top - 1);
+        }
+        col = column_at(start, cursor);
+        if (col < left) left = col;
+        if (col >= left + (size_t)(cols - 1)) left = col - (size_t)(cols - 2);
+        p = top;
+        for (r = 0; r < body; r++) {
+            size_t screen_p,screen_x;
+            if (p == start) cursor_row = r;
+            end = line_end(p);
+            screen_p=p;screen_x=0;
+            if (left) {
+                screen_p=position_in_line(p,end,left);
+                screen_x=column_at(p,screen_p);
+            }
+            if (search_mark!=SIZE_MAX && search_length && search_mark>=p &&
+                search_mark<end && search_length<=text.n-search_mark &&
+                !memcmp(text.s+search_mark,search_pattern,search_length))
+                visible_match(&line,text.s+p,end-p,left,(size_t)(cols-1),
+                              search_mark-p,search_mark-p+search_length,
+                              screen_p-p,screen_x);
+            else visible_from(&line,text.s ? text.s+p : "",end-p,left,
+                              (size_t)(cols-1),screen_p-p,screen_x);
+            draw_row(&out, r, &line, false);
+            if (end < text.n) p = end + (text.s[end] == '\r' ? 2 : 1);
+            else {
+                r++;
+                for (; r < body; r++) { line.n = 0; draw_row(&out, r, &line, false); }
+                break;
+            }
         }
     }
     line_number=layout_at(cursor).line;
     dirty = changed(); width = (size_t)(cols - 1);
     name = filename ? strrchr(filename, '/') + 1 : "[new file]";
-    snprintf(info, sizeof info, "%zu:%zu | ", line_number, col + 1);
+    snprintf(info, sizeof info, "%zu:%zu | ", line_number, layout_at(cursor).column + 1);
     /* Reserve room for the filename and the unsaved marker even in a
      * narrow terminal. Avoid unsigned underflow when line numbers grow. */
     visible(&status, info, strlen(info), 0, width > (dirty ? 2u : 1u) ?
@@ -4036,6 +4558,9 @@ enum { KEY_NONE = 256, KEY_ESCAPE, KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN,
        KEY_HOME, KEY_END, KEY_PAGEUP, KEY_PAGEDOWN, KEY_DELETE, KEY_PASTE,
        KEY_TOP, KEY_BOTTOM, KEY_EOF, KEY_MOUSE };
 
+/* Return one unsigned input byte, -1 for EOF/error, or -2 for a timeout or
+ * interrupted wait. Buffered bytes survive ordinary redraws; a pending signal
+ * yields before consuming them so the main loop can decide what to retain. */
 static int byte(int timeout)
 {
     struct pollfd fd;
@@ -4084,6 +4609,10 @@ static bool key_number(const char **textp, unsigned maximum, unsigned *value)
     return true;
 }
 static void paste(void);
+/* Decode the supported VT/xterm subset into KEY_* values; ordinary UTF-8 is
+ * still returned one byte at a time. Unknown control sequences are consumed
+ * within bounded byte/time limits, with discard state for incomplete frames.
+ * Paste has its own framing: even an idle paste tail must not become keys. */
 static int key(void)
 {
     int c, first, last = 0, k;
@@ -4129,6 +4658,8 @@ static int key(void)
         if (!command_mode && !menu_open && !viewer_text &&
             first >= 'a' && first <= 'z' &&
             binding_action(KEY_ALT_BASE + first)) return KEY_ALT_BASE + first;
+        /* byte() buffered this non-sequence byte. Put it back so rapid
+         * Esc+command typing retains the first character after Esc. */
         input_at--;
         return KEY_ESCAPE;
     }
@@ -4193,6 +4724,8 @@ static int key(void)
     return KEY_NONE;
 }
 
+/* Borrow both strings until the viewer closes. Callers use static strings
+ * or persistent page buffers; a stack-local formatted page would dangle. */
 static void open_viewer(const char *title, const char *contents)
 {
     viewer_title = title; viewer_text = contents; viewer_top = 0;
@@ -4218,14 +4751,17 @@ static void viewer_key(int c)
 
 /* The clipboard and its optional bounded history are ordinary plaintext
  * files. They live in the private editor state directory and are never
- * implemented as shell commands or terminal escape-sequence clipboard APIs. */
+ * implemented as shell commands or terminal escape-sequence clipboard APIs.
+ * Return an owned path, or NULL. leaf must be an internal name or come from
+ * clipboard_path_for()'s slot validation; this helper does not sanitize it.
+ * create permits directory creation, not creation of the returned file. */
 static char *state_path(const char *leaf, bool create)
 {
     const char *base = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
     char *dir, *p, *result;
     size_t n;
     if (!base || *base != '/') {
-        if (!home || *home != '/') return NULL;
+        if (!home || *home != '/') { errno=EINVAL; return NULL; }
         n = strlen(home) + sizeof "/.local/state/editor";
         dir = malloc(n);
         if (!dir) return NULL;
@@ -4246,9 +4782,11 @@ static char *state_path(const char *leaf, bool create)
     }
     {
         struct stat st;
-        if (lstat(dir,&st) < 0 || !S_ISDIR(st.st_mode) ||
-            st.st_uid != geteuid() || (st.st_mode & 077)) {
-            free(dir); return NULL;
+        if (lstat(dir,&st) < 0) {
+            int error=errno; free(dir); errno=error; return NULL;
+        }
+        if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077)) {
+            free(dir); errno=EACCES; return NULL;
         }
     }
     n = strlen(dir) + strlen(leaf) + 2;
@@ -4257,6 +4795,8 @@ static char *state_path(const char *leaf, bool create)
     free(dir);
     return result;
 }
+/* Only a leading ~ or ~/ expands. This is not shell expansion: variables,
+ * wildcards, quoting and ~otheruser remain literal. Caller frees the result. */
 static char *expand_home_path(const char *path)
 {
     const char *home = getenv("HOME");
@@ -4269,43 +4809,131 @@ static char *expand_home_path(const char *path)
     if (result) snprintf(result,n,"%s%s",home,path+1);
     return result;
 }
-static bool private_write(const char *path, const char *data, size_t n, bool no_replace)
+/* A private state read must validate the actual opened inode, not just a
+ * preliminary pathname check. Return absent only for a missing leaf. */
+static int private_read_state(const char *path, Buffer *b, struct stat *seen)
 {
-    char *tmp = NULL, *dir = NULL, *slash;
-    int fd = -1, dfd = -1;
-    bool ok = false, temporary_created = false;
-    tmp = join_strings(path, ".XXXXXX", "");
+    struct stat before, opened, after;
+    if (lstat(path,&before)<0) return errno==ENOENT ? 0 : -1;
+    if (!S_ISREG(before.st_mode) || before.st_uid!=geteuid() || (before.st_mode & 077)) {
+        errno=EACCES; return -1;
+    }
+    if (!read_file(path,b,&opened)) return -1;
+    if (lstat(path,&after)<0) return -1;
+    if (!same_disk_version(&before,&opened) || !same_disk_version(&opened,&after)) {
+        errno=EAGAIN; return -1;
+    }
+    if (seen) *seen=opened;
+    return 1;
+}
+/* Publication uses the version actually read by the caller (NULL means
+ * absent). Validate permission and identity before staging and recheck just
+ * before publication. Non-replacing link protects newly arriving files.
+ * This is optimistic conflict detection, not a lock or compare-and-swap.
+ * After publication success, report durability/identity uncertainty without
+ * falsely claiming the old bytes are still at the destination. */
+static bool private_write_warning;
+static bool private_target_matches(const char *path, const struct stat *expected)
+{
+    struct stat st;
+    if (lstat(path,&st)<0) {
+        if (errno==ENOENT && !expected) return true;
+        if (errno==ENOENT) errno=EAGAIN;
+        return false;
+    }
+    if (!expected) { errno=EEXIST; return false; }
+    if (!same_disk_version(expected,&st)) { errno=EAGAIN; return false; }
+    if (!S_ISREG(st.st_mode) || st.st_uid!=geteuid() || (st.st_mode & 077) ||
+        !(st.st_mode & S_IWUSR)) { errno=EACCES; return false; }
+    if (st.st_nlink!=1) { errno=EMLINK; return false; }
+    return true;
+}
+static bool private_parent_matches(const char *dir, const struct stat *expected)
+{
+    struct stat st;
+    if (lstat(dir,&st)<0) return false;
+    if (!S_ISDIR(st.st_mode) || st.st_uid!=geteuid() || (st.st_mode & 077) ||
+        st.st_dev!=expected->st_dev || st.st_ino!=expected->st_ino) {
+        errno=EAGAIN; return false;
+    }
+    return true;
+}
+static bool private_write_checked(const char *path, const char *data, size_t n,
+                                  const struct stat *expected)
+{
+    char *tmp=NULL,*dir=NULL,*slash;
+    int fd=-1,dfd=-1,permission_fd=-1;
+    struct stat directory,st,written,seen;
+    Buffer verified={0};
+    bool ok=false,temporary_created=false;
+    private_write_warning=false;
+    if (n>LIMIT) { errno=EFBIG; return false; }
+    if (!private_target_matches(path,expected)) return false;
+    dir=strdup(path);
+    if (!dir) goto done;
+    slash=strrchr(dir,'/');
+    if (!slash || slash==dir) { errno=EINVAL; goto done; }
+    *slash=0;
+    dfd=open(dir,O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (dfd<0 || fstat(dfd,&directory)<0 || !private_parent_matches(dir,&directory)) goto done;
+    if (expected) {
+        permission_fd=open(path,O_WRONLY | O_NONBLOCK | O_NOFOLLOW);
+        if (permission_fd<0 || fstat(permission_fd,&st)<0) goto done;
+        if (!same_disk_version(expected,&st)) { errno=EAGAIN; goto done; }
+    }
+    tmp=join_strings(path,".XXXXXX","");
     if (!tmp) goto done;
-    fd = mkstemp(tmp);
-    if (fd < 0) goto done;
-    temporary_created = true;
-    if (fchmod(fd,0600) < 0 || write_all(fd,data,n)<0 || sync_fd(fd)<0) goto done;
+    fd=mkstemp(tmp);
+    if (fd<0) goto done;
+    temporary_created=true;
+    if (fchmod(fd,0600)<0 || write_all(fd,data,n)<0 || sync_fd(fd)<0 || fstat(fd,&written)<0) goto done;
     if (close(fd)<0) { fd=-1; goto done; }
     fd=-1;
-    if (io_cancelled()) goto done;
-    if (no_replace) {
+    if (io_cancelled() || !private_parent_matches(dir,&directory) ||
+        !private_target_matches(path,expected)) goto done;
+    if (!expected) {
         if (link(tmp,path)<0) goto done;
-        (void)unlink(tmp);
-    } else if (rename(tmp,path)<0) goto done;
+        if (unlink(tmp)==0) temporary_created=false;
+    } else {
+        if (rename(tmp,path)<0) goto done;
+        temporary_created=false;
+    }
     ok=true;
-    dir = strdup(path);
-    if (dir && (slash = strrchr(dir,'/'))) {
-        *slash=0;
-        dfd=open(dir,O_RDONLY);
-        if (dfd>=0) (void)sync_fd(dfd);
-    }
+    if (sync_fd(dfd)<0) private_write_warning=true;
+    /* Compare bytes as well as identity: metadata alone cannot establish
+     * that a subsequent same-inode write did not replace the publication. */
+    if (!private_parent_matches(dir,&directory) ||
+        private_read_state(path,&verified,&seen)!=1 ||
+        seen.st_dev!=written.st_dev || seen.st_ino!=written.st_ino ||
+        seen.st_nlink!=1 || verified.n!=n || (n && memcmp(verified.s,data,n)))
+        private_write_warning=true;
 done:
-    { int error = errno;
-      if (dfd>=0) close(dfd);
-      if (fd>=0) close(fd);
-      if (!ok && temporary_created) (void)unlink(tmp);
-      errno = error;
+    { int error=errno;
+      if (fd>=0) (void)close(fd);
+      if (permission_fd>=0) (void)close(permission_fd);
+      if (temporary_created) (void)unlink(tmp);
+      if (dfd>=0) (void)close(dfd);
+      free(verified.s);free(dir);free(tmp);
+      errno=error;
     }
-    free(dir); free(tmp);
     return ok;
 }
+/* Small selector/flag writes use the version observed at command time.
+ * Clipboard contents instead pass the snapshot from their actual read. */
+static bool private_write(const char *path, const char *data, size_t n, bool no_replace)
+{
+    struct stat seen;
+    private_write_warning=false;
+    if (no_replace) return private_write_checked(path,data,n,NULL);
+    if (lstat(path,&seen)==0) return private_write_checked(path,data,n,&seen);
+    if (errno!=ENOENT) return false;
+    return private_write_checked(path,data,n,NULL);
+}
 /* The definitions file is inert text, not an executable config language.
- * A complete parse replaces the table; malformed files cannot partly load. */
+ * Each entry is NAME<TAB>BODY, with empty lines and leading-# lines ignored.
+ * Parse into fresh storage, then replace the live table only on success.
+ * A failed reload retains existing definitions but disables later saves until
+ * a successful reload establishes which disk version they would replace. */
 static bool load_user_commands(void)
 {
     Buffer b={0};
@@ -4364,7 +4992,10 @@ done:
     if (!ok) {errno=saved_error ? saved_error : EINVAL;user_commands_loaded=false;}
     return ok;
 }
-/* Keep a stale editor from silently replacing another session's definitions. */
+/* Save a whole candidate table already validated by change_user_command().
+ * Unlike key bindings, definitions become live only after publication.
+ * Check the observed version before and after staging; this is optimistic
+ * conflict detection, not a lock held against other processes. */
 static bool save_user_command_table(const UserCommand *items, size_t count)
 {
     Buffer b={0}, verified={0};
@@ -4452,13 +5083,17 @@ done:
     if (!ok) errno=error ? error : EIO;
     return ok;
 }
+/* A NULL body removes a definition. Build additions/removals in a separate
+ * table so validation, allocation or pre-publication write failures leave
+ * the currently callable definitions intact. The save routine commits both
+ * disk and live-table changes. */
 static bool change_user_command(const char *name, const char *body)
 {
     UserCommand *copy;
     size_t count=user_command_count;
     int index=user_command_index(name);
     bool okay=false;
-    if (!user_command_name(name)) {tell("Names: a-z followed by a-z, 0-9, _ or -; no built-ins.");return false;}
+    if (!user_command_name(name)) {tell("Use lowercase ASCII names or factory synonyms; canonical commands are reserved.");return false;}
     if (body && (!*body || strlen(body)>=USER_CMD_BODY || strchr(body,'\n') || strchr(body,'\r'))) {
         tell("Definition must be one command line (1-%d bytes).",USER_CMD_BODY-1);return false;
     }
@@ -4498,15 +5133,15 @@ static bool clipboard_history_setting(bool on)
     if (!path) return false;
     ok=private_write(path,on ? "on\n" : "off\n",on ? 3 : 4,false);
     free(path);
-    if (ok) clip_history_enabled=on;
+    if (ok) { clip_history_enabled=on; startup_sync_warning=private_write_warning; }
     return ok;
 }
 static void clipboard_history_load_setting(void)
 {
     char *path=state_path("clipboard-history.enabled",false);
     Buffer b={0}; struct stat st;
-    if (path && read_file(path,&b,&st) && b.n==3 && !memcmp(b.s,"on\n",3))
-        clip_history_enabled=true;
+    if (path && private_read_state(path,&b,&st)==1)
+        clip_history_enabled=b.n==3 && !memcmp(b.s,"on\n",3);
     free(b.s); free(path);
 }
 /* All persistent switches share validation, save-before-apply, feedback and
@@ -4535,6 +5170,11 @@ static void toggle_setting(int kind)
         menu_preferred=startup_esc_menu;
         tell("Esc opens: %s (saved). Movement/edit unchanged.",menu_preferred ? "Menu" : "Command line");
         break;
+    case SETTING_WRAP:
+        wrap_enabled=startup_wrap;
+        top=display_start(top); left=0; goal_set=false;
+        tell("Word wrap %s (saved).",wrap_enabled ? "ON" : "OFF");
+        break;
     case SETTING_MOUSE:
         mouse_enabled=startup_mouse;
         mouse_tracking(mouse_enabled);
@@ -4550,7 +5190,9 @@ static void toggle_setting(int kind)
         break;
     }
     if (startup_sync_warning) {
-        tell("%s saved. Warning: directory sync failed; power-loss durability uncertain.",setting->label);
+        if (kind==SETTING_CLIPHISTORY)
+            tell("%s updated; state could not be verified or synchronized.",setting->label);
+        else tell("%s saved. Warning: directory sync failed; power-loss durability uncertain.",setting->label);
         command_notice("Setting saved with durability warning");
     }
 }
@@ -4601,8 +5243,7 @@ static void clipboard_load_selection(void)
     struct stat st;
     Buffer b={0};
     if (!path) return;
-    if (lstat(path,&st)==0 && S_ISREG(st.st_mode) && st.st_uid==geteuid() &&
-        !(st.st_mode & 077) && read_file(path,&b,&st) && b.n<=CLIP_SLOT_MAX) {
+    if (private_read_state(path,&b,&st)==1 && b.n<=CLIP_SLOT_MAX) {
         if (b.n==0) selected_clipboard[0]=0;
         else if (b.s && !(memchr(b.s,0,b.n))) {
             b.s[b.n]=0;
@@ -4611,35 +5252,26 @@ static void clipboard_load_selection(void)
     }
     free(b.s); free(path);
 }
-/* Return 1 if the selected/named clipboard exists, 0 if absent, -1 on error. */
+/* Return 1 with owned bytes in out, 0 if absent, -1 on error. Pass an empty
+ * output buffer. Absence is a normal unwritten slot; do not turn an unsafe
+ * or unreadable existing clipboard into an empty successful read. */
+static int clipboard_read_path(const char *path, Buffer *out, struct stat *seen)
+{
+    int result=private_read_state(path,out,seen);
+    if (result==1 && out->n && memchr(out->s,0,out->n)) { errno=EINVAL; result=-1; }
+    if (result<0) {
+        int error=errno;
+        free(out->s);memset(out,0,sizeof *out);errno=error;
+    }
+    return result;
+}
 static int clipboard_read_named(const char *slot, Buffer *out)
 {
     char *path=clipboard_path_for(slot,true);
-    struct stat st;
-    int result;
-    if (!path) { errno=EACCES; return -1; }
-    if (lstat(path,&st)<0) {
-        result=errno==ENOENT ? 0 : -1;
-        free(path); return result;
-    }
-    if (!S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
-        (st.st_mode & 077)) {
-        free(path); errno=EACCES; return -1;
-    }
-    {
-        bool read_ok=read_file(path,out,&st);
-        if (!read_ok || (out->n && memchr(out->s,0,out->n))) {
-            /* A rejected/partly read clipboard may own up to LIMIT bytes.
-             * Free even when the read fails after allocating megabytes. */
-            int saved_error = read_ok ? EINVAL : errno;
-            free(out->s);
-            memset(out,0,sizeof *out);
-            free(path);
-            errno=saved_error;
-            return -1;
-        }
-    }
-    free(path); return 1;
+    int result,error;
+    if (!path) return -1;
+    result=clipboard_read_path(path,out,NULL);error=errno;
+    free(path);errno=error;return result;
 }
 static int clipboard_read(Buffer *out)
 {
@@ -4807,6 +5439,10 @@ failure:
     free(dir);errno=error;
     return SIZE_MAX;
 }
+/* Archive the previous bytes, shared across all slots. Fixed-width timestamp
+ * names sort newest first; link-based publication retries collisions without
+ * replacing an older snapshot. A false result may mean pruning failed after
+ * the new archive was already created; callers must not infer rollback. */
 static bool clipboard_archive(const Buffer *before)
 {
     char *dir=NULL, *path=NULL;
@@ -4825,34 +5461,50 @@ static bool clipboard_archive(const Buffer *before)
     if (!path) goto done;
     for (tries=0;tries<100;tries++,stamp++) {
         snprintf(path,strlen(dir)+36,"%s/clip-%020llu.txt",dir,stamp);
-        if (private_write(path,before->s,before->n,true)) { ok=true; break; }
+        if (private_write(path,before->s,before->n,true)) { ok=!private_write_warning; break; }
         if (errno!=EEXIST) break;
     }
     if (ok && clip_history_entries(current,true)==SIZE_MAX) ok=false;
 done:
     free(path);free(dir);return ok;
 }
-/* New clipboard bytes become visible atomically. History failure does not
- * undo a successful clipboard replacement; callers are informed. */
-enum { CLIP_FAILED, CLIP_SAVED, CLIP_SAVED_NO_HISTORY };
+/* Clipboard writes use the same observed snapshot for conflict detection
+ * and optional history. History still follows replacement, as before.
+ * If publication cannot be verified or synchronized, cut must retain text. */
+enum { CLIP_FAILED, CLIP_SAVED, CLIP_SAVED_NO_HISTORY, CLIP_SAVED_UNVERIFIED,
+       CLIP_SAVED_UNVERIFIED_NO_HISTORY };
+static const char *clipboard_save_warning(int result)
+{
+    if (result==CLIP_SAVED_UNVERIFIED_NO_HISTORY)
+        return " Clipboard publication uncertain; history save/cleanup incomplete.";
+    if (result==CLIP_SAVED_UNVERIFIED)
+        return " Clipboard publication could not be verified or synchronized.";
+    if (result==CLIP_SAVED_NO_HISTORY) return " Clipboard history save/cleanup incomplete.";
+    return "";
+}
 static int clipboard_set(const char *s, size_t n)
 {
     Buffer before={0};
-    char *path;
-    int got=clipboard_read(&before);
-    bool ok, archive_ok;
-    if (got<0) { tell("Clipboard read failed: %s.",strerror(errno)); return CLIP_FAILED; }
+    struct stat seen;
+    char *path=clipboard_path(true);
+    int got,result=CLIP_FAILED;
+    bool warned,archive_ok;
+    if (!path) { tell("Clipboard directory unavailable: %s.",strerror(errno)); return CLIP_FAILED; }
+    got=clipboard_read_path(path,&before,&seen);
+    if (got<0) { tell("Clipboard read failed: %s.",strerror(errno)); goto done; }
     if (got && before.n==n && (!n || !memcmp(before.s,s,n))) {
-        free(before.s); tell("Clipboard unchanged."); return CLIP_SAVED;
+        tell("Clipboard unchanged.");result=CLIP_SAVED;goto done;
     }
-    path=clipboard_path(true);
-    if (!path) { free(before.s); tell("Clipboard directory unavailable."); return CLIP_FAILED; }
-    ok=private_write(path,s,n,false);
-    if (!ok) tell("Clipboard write failed: %s.",strerror(errno));
-    archive_ok=ok && clipboard_archive(&before);
-    if (ok && !archive_ok) tell("Clipboard updated; history save/cleanup incomplete.");
-    free(path);free(before.s);
-    return !ok ? CLIP_FAILED : archive_ok ? CLIP_SAVED : CLIP_SAVED_NO_HISTORY;
+    if (!private_write_checked(path,s,n,got ? &seen : NULL)) {
+        tell("Clipboard write failed: %s.",strerror(errno));goto done;
+    }
+    warned=private_write_warning;
+    archive_ok=clipboard_archive(&before);
+    result=warned ? (archive_ok ? CLIP_SAVED_UNVERIFIED : CLIP_SAVED_UNVERIFIED_NO_HISTORY) :
+                    (archive_ok ? CLIP_SAVED : CLIP_SAVED_NO_HISTORY);
+    if (result!=CLIP_SAVED) tell("Clipboard updated;%s",clipboard_save_warning(result));
+done:
+    free(path);free(before.s);return result;
 }
 /* A history listing needs a short preview, not up to 64 complete 8 MiB
  * documents. Read only the displayed prefix; clipuse still validates the
@@ -4945,6 +5597,10 @@ failed:
     error=errno;free(path);free(dir);
     tell("Clipboard history listing failed: %s. No partial list shown.",strerror(error));
 }
+/* Numbers are 1-based positions in a freshly scanned, newest-first list,
+ * not durable snapshot IDs. Another session can change that ordering between
+ * listing and use. Validate the selected file fully before replacing a slot;
+ * restoration changes the selected clipboard file, not the document text. */
 static void clip_history_use(size_t number)
 {
     ClipEntry entries[CLIP_HISTORY_MAX];
@@ -4968,12 +5624,14 @@ static void clip_history_use(size_t number)
     else {
         int result = clipboard_set(b.s,b.n);
         if (result) tell("Clipboard restored from entry %zu.%s",number,
-                         result == CLIP_SAVED_NO_HISTORY ? " Clipboard history save/cleanup incomplete." : "");
+                         clipboard_save_warning(result));
     }
     free(dir);free(path);free(b.s);
 }
-/* Move the active document (including its persistent undo state) without
- * copying its bytes. The only active buffer is owned by the editor globals. */
+/* Move the active document into an empty context without copying its bytes.
+ * d must not already own allocations: it is cleared first. Owning globals
+ * are then emptied so opening the clipboard cannot free the parent document.
+ * Derived layout checkpoints are discarded, never shared between contexts. */
 static void document_capture(DocumentContext *d)
 {
     layout_reset();
@@ -5002,6 +5660,9 @@ static void document_capture(DocumentContext *d)
     newline[0]='\n'; newline[1]=0; newline_n=1;
     journal_ignored=journal_dirty=journal_rebased=journal_branched=false;
 }
+/* Consume the captured context: free the temporary active document, move
+ * d's allocations back to the globals, then zero d to prevent a second free.
+ * The caller handles UI modes and any save required before this transfer. */
 static void document_restore(DocumentContext *d)
 {
     layout_reset();
@@ -5022,9 +5683,9 @@ static void document_restore(DocumentContext *d)
     journal_rebased=d->journal_rebased; journal_branched=d->journal_branched;
     memset(d,0,sizeof *d);
 }
-/* Return from temporary clipboard editing without touching the parent.
- * The clipboard command toggles contexts, and write does not. quit and quit!
- * remain global editor-exit commands. */
+/* Global exit must also account for a parked parent: its text can be dirty
+ * or its saved-undo position can still need persistence. Looking only at the
+ * visible clipboard document would miss that work. */
 static bool parent_unsaved(void)
 {
     if (!editing_clipboard) return false;
@@ -5035,6 +5696,9 @@ static bool parent_unsaved(void)
         (parent_document.filename && parent_document.journal_dirty &&
          parent_document.history);
 }
+/* Restore the parked document and leave clipboard-specific UI behind. write
+ * normally saves and stays; the clipboard command requests this return after
+ * a successful save. quit/quit! remain program exits, not context switches. */
 static void clipboard_return(void)
 {
     if (!editing_clipboard) return;
@@ -5047,8 +5711,10 @@ static void clipboard_return(void)
     reset_screen(); resized=1;
     tell("Returned to %s.",filename ? filename : "[new file]");
 }
-/* Switching documents is transactional: failures keep the original file,
- * undo chain and cursor. A dirty buffer must be written first. */
+/* Stage the new path, text and saved snapshot before releasing active state.
+ * Read/allocation failures retain the current document; a dirty document is
+ * refused, and pending history must be saved first. Once the new document is
+ * installed, a rejected optional journal does not undo the successful open. */
 static void read_document(const char *name)
 {
     char *expanded=NULL,*path=NULL;
@@ -5061,7 +5727,7 @@ static void read_document(const char *name)
     expanded=expand_home_path(name);
     if (!expanded || !(path=resolve_path(expanded))) goto failure;
     if (lstat(path,&st)==0) {
-        if (S_ISDIR(st.st_mode)) { /* Directory navigation is handled below. */
+        if (S_ISDIR(st.st_mode)) { /* ls owns directory browsing. */
             tell("Directory given; use ls DIRECTORY to browse.");goto done;
         }
         if (!read_file(path,&fresh,&st)) goto failure;
@@ -5102,6 +5768,9 @@ failure:
 done:
     free(expanded);free(path);free(fresh.s);free(fresh_saved.s);
 }
+/* At most one parent document can be parked. Capture it before opening the
+ * slot, then restore it if the open fails. Returning from an edited slot goes
+ * through save_file(); a failed save keeps the slot and parent context intact. */
 static void clipboard_open(void)
 {
     char *path;
@@ -5171,6 +5840,9 @@ static int filename_compare(const void *a, const void *b)
 {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
+/* Bound the displayed listing to 1024 collected entries and page capacity.
+ * Sort that collected subset, not the entire directory; a truncated listing
+ * must not be treated as evidence that other names do not exist. */
 static void directory_list(const char *provided)
 {
     char *expanded = NULL;
@@ -5239,6 +5911,9 @@ done:
     free(expanded);
 }
 static void complete_command(void);
+/* Filename completion operates on the literal argument tail at end of draft,
+ * not shell words. Keep the user's spelling (including ~/) and append only a
+ * checked common suffix. No document is opened and no command is executed. */
 static void path_complete(void)
 {
     size_t start = 0, prefix_n, nmatch = 0, common = 0, append, extra;
@@ -5347,6 +6022,10 @@ done:
     free(entered); free(expanded); free(dir); free(first); free(full);
 }
 
+/* Collect one bracketed paste privately and commit only at its end marker.
+ * Rejection or an inactive editing surface still requires draining the frame.
+ * On cancellation/idle timeout, retain only marker progress across calls,
+ * not staged bytes; key() keeps draining until a real terminator arrives. */
 static void paste(void)
 {
     static const char end[] = "\033[201~";
@@ -5453,6 +6132,9 @@ static void paste(void)
     free(b.s);
 }
 
+/* Reverse browses by applying real undo/redo steps to the active document.
+ * Closing the browser keeps the selected history position; it is not a
+ * preview that restores the entry position, and it never saves by itself. */
 static void reverse_key(int c)
 {
     size_t amount = 0;
@@ -5473,6 +6155,9 @@ static void reverse_key(int c)
     if (amount) (void)history_move(redo, amount, true);
 }
 
+/* Replace the command draft and place its byte cursor at the end. Prompt
+ * context and command_mode belong to the caller, so the same storage also
+ * serves filename entry, menu arguments and command-history recall. */
 static void command_set(const char *s)
 {
     size_t n = strlen(s);
@@ -5489,8 +6174,8 @@ static void complete_command(void)
 {
     size_t start=0, end=0, typed, i, matches=0, word_end, tail_n;
     char first[64], replacement[64];
-    const char *token, *begin, *finish;
-    bool found, prefer_canonical=false;
+    const char *token, *begin;
+    bool found, prefer_canonical=false, prefer_user=false;
     size_t used;
     while (command[start] == ' ' || command[start] == '\t') start++;
     word_end=start;
@@ -5520,38 +6205,33 @@ static void complete_command(void)
                        "Esc/q returns to your unchanged command.\n"
                        "Type more letters and press Tab again.\n\n");
     replacement[0]=0;
+    if (typed==end-start) {
+        for (i=0;i<user_command_count;i++)
+            if (!command_lookup(user_commands[i].name) &&
+                strlen(user_commands[i].name)==typed &&
+                !strncasecmp(user_commands[i].name,command+start,typed)) prefer_user=true;
+    }
     /* Prefer matching full command names over aliases. Otherwise an alias
      * such as "line" could block completion of the distinct "list" name. */
     for (i=0;i<COMMAND_INFO_COUNT;i++)
-        if (!strncasecmp(command_info[i].name,command+start,typed))
+        if (!(no_cmd && external_command(command_info[i].name)) &&
+            !strncasecmp(command_info[i].name,command+start,typed))
             prefer_canonical=true;
     for (i=0;i<COMMAND_INFO_COUNT;i++) {
         found=false; token=NULL;
+        if (prefer_user || (no_cmd && external_command(command_info[i].name))) continue;
         if (!strncasecmp(command_info[i].name,command+start,typed)) {
             token=command_info[i].name;
             found=true;
         } else if (!prefer_canonical) {
             const char *p=command_info[i].synonyms;
-            while (*p) {
-                size_t n;
-                while (*p==' ' || *p==',') p++;
-                begin=p;
-                while (*p && *p!=',') p++;
-                finish=p;
-                while (finish>begin && finish[-1]==' ') finish--;
-                n=(size_t)(finish-begin);
-                if (n>=typed && !strncasecmp(begin,command+start,typed)) {
-                    /* Alias completion retains the alias the user began. */
-                    if (n<sizeof replacement) {
-                        if (!found) {
-                            char alias[64];
-                            memcpy(alias,begin,n); alias[n]=0;
-                            /* Save the candidate only if this is the sole
-                             * matching canonical operation so far. */
-                            if (matches==0) memcpy(replacement,alias,n+1);
-                            found=true;
-                        }
-                    }
+            size_t n;
+            while ((begin=next_synonym(&p,&n))!=NULL) {
+                if (n>=typed && !strncasecmp(begin,command+start,typed) &&
+                    synonym_active(begin,n) && n<sizeof replacement) {
+                    /* Alias completion retains the active alias the user began. */
+                    if (!matches) {memcpy(replacement,begin,n);replacement[n]=0;}
+                    found=true;
                     break;
                 }
             }
@@ -5564,7 +6244,9 @@ static void complete_command(void)
             guide_append(&used,"  %s\n    %s\n",command_info[i].name,command_info[i].summary);
         }
     }
-    for (i=0;i<user_command_count;i++) if (!strncasecmp(user_commands[i].name,command+start,typed)) {
+    for (i=0;i<user_command_count;i++) if (!command_lookup(user_commands[i].name) &&
+        (!prefer_user || strlen(user_commands[i].name)==typed) &&
+        !strncasecmp(user_commands[i].name,command+start,typed)) {
         if (!matches) memcpy(replacement,user_commands[i].name,strlen(user_commands[i].name)+1);
         matches++;
         guide_append(&used,"  %s\n    %s\n",user_commands[i].name,user_commands[i].body);
@@ -5616,6 +6298,9 @@ static void request_menu_write(void)
     } else if (errno == ENOENT) save_file(NULL, false);
     else tell("Cannot inspect destination: %s", strerror(errno));
 }
+/* History owns its string copies and stores unique entries newest first.
+ * Allocation failure only skips recall storage; it must not prevent the
+ * requested command from running. Menu/hotkey callers suppress this list. */
 static void command_remember(const char *s)
 {
     size_t i;
@@ -5632,6 +6317,9 @@ static void command_remember(const char *s)
     memmove(command_history + 1, command_history, command_history_n * sizeof *command_history);
     command_history[0] = copy; command_history_n++;
 }
+/* The first Up preserves the unsubmitted draft. Down beyond the newest
+ * history entry restores that draft, including an empty one. This history
+ * is process-local and separate from document undo. */
 static void command_browse(int direction)
 {
     if (direction < 0) {
@@ -5657,6 +6345,9 @@ static size_t line_count(void)
 {
     return layout_at(text.n).line;
 }
+/* Public command line numbers are 1-based; the result is a byte offset.
+ * SIZE_MAX means no such line, while text.n can be a valid empty final line.
+ * Reuse available checkpoints without constructing the entire line index. */
 static size_t numbered_line(size_t number)
 {
     size_t i=0,line=1,lo=0,hi=layout_count,mid;
@@ -5701,6 +6392,9 @@ static void delete_line_range(size_t first, size_t last)
     if (end > from) (void)edit(from, end-from, NULL, 0, false);
     else tell("No line to delete.");
 }
+/* Parse a positive prefix and return its first unconsumed byte. Callers must
+ * validate that remainder (range separator, another argument, or blank_tail)
+ * rather than accepting a numeric prefix as a complete argument. */
 static bool positive_number(const char *s, const char **after, size_t *out)
 {
     char *end; unsigned long long number;
@@ -5716,13 +6410,43 @@ static bool blank_tail(const char *s)
     while (*s == ' ' || *s == '\t') s++;
     return !*s;
 }
+/* Symbolic addresses use the same vocabulary as standalone movement.
+ * Resolve the last line only when a symbolic last-line address is used.
+ * Counts, columns and clipboard slots still use positive_number(). */
+static bool line_address(const char *s, const char **after, size_t *out)
+{
+    size_t n;
+    if (positive_number(s,after,out)) return true;
+    s+=strspn(s," \t");
+    n=strcspn(s," \t-");
+    if ((n==3 && (!strncasecmp(s,"bof",n) || !strncasecmp(s,"top",n))) ||
+        (n==5 && (!strncasecmp(s,"start",n) || !strncasecmp(s,"first",n)))) *out=1;
+    else if ((n==3 && (!strncasecmp(s,"end",n) || !strncasecmp(s,"eof",n))) ||
+             (n==4 && !strncasecmp(s,"last",n)) ||
+             (n==6 && !strncasecmp(s,"bottom",n))) *out=line_count();
+    else return false;
+    *after=s+n;
+    return true;
+}
+/* Shared inclusive range grammar. If there is no dash, preserve whitespace
+ * after the address so filter-lines can require a separate shell command. */
+static bool line_range(const char *s, const char **after, size_t *first, size_t *last)
+{
+    const char *sep;
+    if (!line_address(s,after,first)) return false;
+    *last=*first;
+    sep=*after+strspn(*after," \t");
+    if (*sep=='-') return line_address(sep+1,after,last);
+    return true;
+}
 static void vertical(int direction, int count);
 static bool history_suppress;
 
-/* Deliberate external command invocation. Nothing opened or pasted is executed.
- * The child has no terminal stdin and stdout/stderr never reach our screen.
- * A private temporary input file avoids pipe deadlock for large filter input;
- * the two output pipes are drained concurrently with bounded buffers. */
+#ifndef EDITOR_NO_CMD
+/* Validate captured stdout incrementally and normalize newlines as bytes
+ * arrive. pending_cr carries a trailing CR across reads; flush it once at EOF.
+ * maximum bounds the converted result, not the raw child output. This is
+ * intentionally stricter than opening a file, which preserves existing bytes. */
 static bool process_append(Buffer *b, const unsigned char *src, size_t n,
                            size_t maximum, bool *pending_cr)
 {
@@ -5762,6 +6486,15 @@ static bool process_flush_cr(Buffer *b, size_t maximum, bool pending_cr)
     memcpy(b->s+b->n,newline,newline_n);b->n+=newline_n;b->s[b->n]=0;
     return true;
 }
+/* Run an explicitly requested /bin/sh command with the editor's privileges.
+ * Its standard input is /dev/null or a temporary filter-input file; stdout
+ * and stderr use separate pipes. This descriptor setup is not a sandbox.
+ * The input file avoids a parent-write/child-write deadlock on large filters.
+ *
+ * output starts empty and remains caller-owned, including partial bytes on
+ * failure. Only a true return makes it eligible for an edit. Completion needs
+ * both pipe EOF and a successful child exit; stderr is a bounded diagnostic,
+ * never document text. The caller supplies nonempty report storage. */
 static bool process_capture(const char *cmd, const char *input_bytes, size_t input_n,
                             size_t maximum, Buffer *output, char *report, size_t report_n)
 {
@@ -5773,6 +6506,8 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
     struct sigaction previous_chld, default_chld;
     size_t stderr_used=0;
     char stderr_text[256]={0};
+    /* Last line of defense: before pipes, files or process creation. */
+    if (no_cmd) { snprintf(report,report_n,"%s",cmd_disabled); errno=EPERM; return false; }
     if (!cmd || !*cmd) { snprintf(report,report_n,"Shell command required."); return false; }
     if (io_cancelled()) {
         snprintf(report,report_n,"Command stopped; output discarded (interrupted).");
@@ -5814,18 +6549,31 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
         goto failed;
     }
     if (pid==0) {
-        int source=-1;
+        int source=-1,output_source=out[1],error_source=err[1];
         if (io_cancelled()) _exit(127);
-        /* Independent group so cancellation also stops a shell pipeline. */
+        /* A separate group lets cancellation reach ordinary shell pipelines
+         * as well as the shell. Commands may deliberately leave this group. */
         (void)setpgid(0,0);
         if (input_file) source=fileno(input_file);
         else source=open("/dev/null",O_RDONLY);
-        if (source<0 || dup2(source,STDIN_FILENO)<0 ||
-            dup2(out[1],STDOUT_FILENO)<0 || dup2(err[1],STDERR_FILENO)<0) _exit(127);
-        if (source>STDERR_FILENO) close(source);
-        close(out[0]);close(out[1]);close(err[0]);close(err[1]);
-        if (tty_extra>=0) close(tty_extra);
-        /* The child gets default signals; our editor handlers are not inherited. */
+        /* A launcher may have closed one or more standard descriptors.
+         * Pipes, the filter file and /dev/null can then occupy those numbers.
+         * Move each source above stderr before replacing any standard fd. */
+        if (source>=0 && source<=STDERR_FILENO) source=fcntl(source,F_DUPFD,3);
+        if (output_source<=STDERR_FILENO) output_source=fcntl(output_source,F_DUPFD,3);
+        if (error_source<=STDERR_FILENO) error_source=fcntl(error_source,F_DUPFD,3);
+        if (source<0 || output_source<0 || error_source<0 || dup2(source,STDIN_FILENO)<0 ||
+            dup2(output_source,STDOUT_FILENO)<0 || dup2(error_source,STDERR_FILENO)<0) _exit(127);
+        close(source);
+        if (output_source!=out[1]) close(output_source);
+        if (error_source!=err[1]) close(error_source);
+        for (int j=0;j<2;j++) {
+            if (out[j]>STDERR_FILENO) close(out[j]);
+            if (err[j]>STDERR_FILENO) close(err[j]);
+        }
+        if (tty_extra>STDERR_FILENO) close(tty_extra);
+        /* Restore defaults for these signals, including dispositions ignored
+         * by the editor. exec also resets installed signal handlers. */
         signal(SIGINT,SIG_DFL);signal(SIGTERM,SIG_DFL);
         signal(SIGQUIT,SIG_DFL);signal(SIGPIPE,SIG_DFL);
 #ifdef SIGXFSZ
@@ -5902,8 +6650,8 @@ static bool process_capture(const char *cmd, const char *input_bytes, size_t inp
         good=false;error=errno ? errno : EFBIG;
     }
     if (!good && child_owned) {
-        /* Cancel the entire pipeline before waiting. Do not leave children
-         * using pipes after the editor has returned to its command prompt. */
+        /* Kill the owned shell group before cleanup waits. The direct PID
+         * is a fallback if group creation failed; never signal a reaped PID. */
         (void)kill(-pid,SIGKILL);(void)kill(pid,SIGKILL);
     }
     for (i=0;i<2;i++) if (io[i]>=0) close(io[i]);
@@ -5934,6 +6682,10 @@ failed:
     if (child_signals) (void)sigaction(SIGCHLD,&previous_chld,NULL);
     return good && waited==pid && WIFEXITED(status) && WEXITSTATUS(status)==0;
 }
+/* Capture and validate everything before one edit() transaction. A failed
+ * command leaves text and document undo unchanged, but cannot roll back the
+ * shell command's own external side effects. Empty successful filter output
+ * is a valid deletion; an insertion with no output is a no-op. */
 static bool insert_shell_output(const char *command_line, size_t start, size_t length,
                                 bool replacing)
 {
@@ -5941,6 +6693,7 @@ static bool insert_shell_output(const char *command_line, size_t start, size_t l
     char report[256];
     bool okay;
     size_t maximum;
+    if (no_cmd) {tell("%s",cmd_disabled);errno=EPERM;return false;}
     if (!*command_line) {tell("Shell command required.");return false;}
     if (start>text.n || length>text.n-start) {tell("Invalid text range.");return false;}
     maximum=LIMIT-(text.n-length);
@@ -5967,13 +6720,27 @@ static bool insert_shell_output(const char *command_line, size_t start, size_t l
     free(output.s);
     return okay;
 }
+#else
+/* No child-process machinery is present in this build. Keep a fail-closed
+ * stub for callers so even future direct dispatch cannot execute a command. */
+static bool insert_shell_output(const char *command_line, size_t start, size_t length,
+                                bool replacing)
+{
+    (void)command_line; (void)start; (void)length; (void)replacing;
+    tell("%s",cmd_disabled); errno=EPERM; return false;
+}
+#endif
 
 /* Execute a deliberately small noninteractive editor instruction language.
- * A script cannot open a prompt, change files, quit, or execute arbitrary
- * document text. It may invoke shell explicitly and call user definitions.
- * Steps are separate undo transactions; failure stops later instructions. */
+ * Its editor commands cannot open prompts, switch documents or quit. Explicit
+ * shell commands still have the user's OS privileges and side effects.
+ * Steps are separate undo transactions; failure stops later instructions
+ * without rolling back successful earlier steps. */
 static bool execute_script_step(const char *line);
 static bool run_script_file(const char *name);
+/* This expansion path is for scripts only. Always return to the restricted
+ * dispatcher, including for nested definitions; execute() expands directly
+ * typed aliases separately so those retain normal interactive prompts. */
 static bool call_user_command(const char *name)
 {
     int index=user_command_index(name);
@@ -5990,6 +6757,10 @@ static bool call_user_command(const char *name)
     script_depth--;
     return ok;
 }
+/* Read one bounded, owned script snapshot before executing it. Lines are
+ * trimmed at both ends; # is a comment only at the first nonblank byte.
+ * There is no editor-level quoting, substitution or inline-comment parser.
+ * Nested runs/definitions share one step budget and balanced depth counter. */
 static bool run_script_file(const char *name)
 {
     Buffer b={0};
@@ -6037,16 +6808,14 @@ static bool run_script_file(const char *name)
 done:
     free(b.s);free(path);return ok;
 }
-/* A line-range filter is explicit; plain filter works on the entire file. */
+/* Include each selected line's own trailing newline, if present. Unlike
+ * deleting the final line, filtering must not borrow the preceding line's
+ * separator: that byte belongs to the unselected document prefix. */
 static bool filter_range_command(const char *arguments)
 {
     const char *rest;
     size_t first,last,from,end,total=line_count();
-    while (*arguments==' ' || *arguments=='\t') arguments++;
-    if (!positive_number(arguments,&rest,&first)) goto usage;
-    if (*rest=='-') {
-        if (!positive_number(rest+1,&rest,&last)) goto usage;
-    } else last=first;
+    if (!line_range(arguments,&rest,&first,&last)) goto usage;
     if (*rest!=' ' && *rest!='\t') goto usage;
     while (*rest==' ' || *rest=='\t') rest++;
     if (!*rest || !first || last<first || last>total) goto usage;
@@ -6055,9 +6824,13 @@ static bool filter_range_command(const char *arguments)
     if (from==SIZE_MAX || end==SIZE_MAX || from>end) goto usage;
     return insert_shell_output(rest,from,end-from,true);
 usage:
-    tell("Use filter-lines FIRST[-LAST] SHELL_COMMAND (line numbers 1-%zu).",total);
+    tell("Use filter-lines FIRST[-LAST] SHELL_COMMAND (1-%zu, top/start/first/bof, bottom/end/last/eof).",total);
     return false;
 }
+/* This allowlist is the script policy boundary, not a wrapper for execute().
+ * Alias lookup feeds back here, and every dispatch consumes the shared step
+ * budget. Add an operation only if it can report success without a prompt or
+ * document switch; a recognized interactive command is not enough. */
 static bool execute_script_step(const char *source)
 {
     char copy[COMMAND_SIZE], *verb=copy, *arg;
@@ -6081,6 +6854,7 @@ static bool execute_script_step(const char *source)
     if (!info) {tell("Unknown script command: %s.",verb);return false;}
     verb=copy; /* command_lookup returned canonical name, not the local token */
     verb=(char *)info->name;
+    if (no_cmd && external_command(verb)) {tell("%s",cmd_disabled);return false;}
     if (!strcmp(verb,"shell")) return insert_shell_output(arg,cursor,0,false);
     if (!strcmp(verb,"filter")) return insert_shell_output(arg,0,text.n,true);
     if (!strcmp(verb,"filter-lines")) return filter_range_command(arg);
@@ -6094,7 +6868,7 @@ static bool execute_script_step(const char *source)
         return find_match(!strcmp(verb,"next"),false);
     }
     if (!strcmp(verb,"goto")) {
-        if (!positive_number(arg,&rest,&line) || (p=numbered_line(line))==SIZE_MAX)
+        if (!line_address(arg,&rest,&line) || (p=numbered_line(line))==SIZE_MAX)
             goto usage;
         col=1;
         if (!blank_tail(rest) && (!positive_number(rest,&rest,&col) || !blank_tail(rest)))
@@ -6122,6 +6896,9 @@ usage:
 }
 
 static void execute(void);
+/* Most menu entries reuse the interactive dispatcher. Special actions handle
+ * subpages, argument prompts and menu-specific save/quit confirmation first.
+ * Suppress command recall for menu actions without suppressing document undo. */
 static void menu_run(void)
 {
     size_t count;
@@ -6142,6 +6919,9 @@ static void menu_run(void)
     menu_open=false; menu_number=-1; menu_discard_pending=false; group=false;
     if (chosen->action == MENU_WRITE) { request_menu_write(); return; }
     if (chosen->action == MENU_PARAMETER) {
+        if (no_cmd && chosen->command && external_command(chosen->command)) {
+            tell("%s",cmd_disabled);return;
+        }
         menu_argument_mode=true;
         menu_argument_command=chosen->command;
         menu_argument_label=chosen->question;
@@ -6160,7 +6940,7 @@ static void menu_run(void)
     /* Success shows the new value in place. Errors/warnings retain their
      * viewer rather than disappearing behind the menu. */
     if (!viewer_text && !command_mode &&
-        ((menu_page==MENU_SETTINGS && setting_toggle_index(cmd)>=0) ||
+        (((menu_page==MENU_SETTINGS || menu_page==MENU_HELP) && setting_toggle_index(cmd)>=0) ||
          chosen->action==MENU_MOVEMENT)) menu_open=true;
 }
 static void menu_key(int c)
@@ -6200,6 +6980,11 @@ static void menu_key(int c)
         menu_run();
     }
 }
+/* Parse a private copy: command remains the user's recoverable draft when a
+ * help/error page opens. Split only the verb from its argument tail; quoting
+ * and argument rules belong to each command (or /bin/sh for shell/filter).
+ * Canonical names from command_lookup() keep aliases on the same code path.
+ * This interactive dispatcher is intentionally separate from script policy. */
 static void execute(void)
 {
     char parsed[COMMAND_SIZE], *verb = parsed, *arg;
@@ -6223,8 +7008,9 @@ resolve_command:
     if (*arg) { *arg++ = 0; while (*arg == ' ' || *arg == '\t') arg++; }
     command_mode = false; group = false;
     if (!*verb) return;
-    /* The count-first form is restricted to deletion, to prevent a number
-     * from accidentally running any other command or becoming a keybinding.
+    /* The count-first form is a special dline grammar, not a general repeat
+     * prefix. A user-created key binding may contain this complete command;
+     * typing digits in the document still inserts literal text.
      * Example: 13 dline removes 13 consecutive lines at the cursor. */
     {
         size_t repeat;
@@ -6266,6 +7052,7 @@ resolve_command:
         return;
     }
     canonical = info->name;
+    if (no_cmd && external_command(canonical)) {tell("%s",cmd_disabled);return;}
     if (!strcmp(canonical,"shell")) {
         if (!*arg) request_argument("shell","Shell> ");
         else (void)insert_shell_output(arg,cursor,0,false);
@@ -6302,7 +7089,7 @@ resolve_command:
         if (!*arg) request_argument("undefine","User name> ");
         else if (!blank_tail(arg+strcspn(arg," \t")))
             command_usage(info,"Use undefine NAME, no extra arguments.");
-        else (void)change_user_command(arg,NULL);
+        else { arg[strcspn(arg," \t")]=0; (void)change_user_command(arg,NULL); }
         return;
     }
     if (!strcmp(canonical,"run")) {
@@ -6394,8 +7181,12 @@ resolve_command:
             if (!clipboard_choose(slot)) {
                 tell("Could not persist clipboard selection: %s.",strerror(errno));return;
             }
-            if (in_subeditor) clipboard_open();
-            else tell("Selected clipboard %s.", *slot ? slot : "default");
+            {
+                bool warning=private_write_warning;
+                if (in_subeditor) clipboard_open();
+                else tell("Selected clipboard %s.", *slot ? slot : "default");
+                if (warning) tell("Clipboard selection updated; state could not be verified or synchronized.");
+            }
         }
         return;
     }
@@ -6427,18 +7218,8 @@ resolve_command:
         const char *clip_warning;
         if (!text.n) { tell("Document is empty."); return; }
         if (!*arg) { line=current_line_number(); last=line; }
-        else {
-            if (!positive_number(arg,&rest,&line)) {
-                tell("Use %s [LINE|FIRST-LAST].",canonical); return;
-            }
-            while (*rest==' ' || *rest=='\t') rest++;
-            last=line;
-            if (*rest=='-') {
-                if (!positive_number(rest+1,&rest,&last)) {
-                    tell("Use %s FIRST-LAST.",canonical); return;
-                }
-            }
-            if (!blank_tail(rest)) { tell("Use %s [LINE|FIRST-LAST].",canonical);return; }
+        else if (!line_range(arg,&rest,&line,&last) || !blank_tail(rest)) {
+            tell("Use %s [LINE|FIRST-LAST], e.g. %s 104-eof.",canonical,canonical); return;
         }
         if (!line || last<line || last>all) {
             tell("Line range must be within 1-%zu.",all); return;
@@ -6448,13 +7229,19 @@ resolve_command:
         if (from==SIZE_MAX || end==SIZE_MAX || from>end) {
             tell("Invalid line range."); return;
         }
+        /* Persist the copied bytes before deleting anything for cut. The
+         * clipboard write and document edit are separate commits: if edit()
+         * fails, the original text remains and the updated clipboard is kept. */
         if (from==end && from==text.n && from>0 && text.s[from-1]=='\n') {
             size_t separator=(from>1 && text.s[from-2]=='\r') ? 2 : 1;
             clip_result=clipboard_set(text.s+from-separator,separator);
         } else clip_result=clipboard_set(text.s+from,end-from);
         if (!clip_result) return;
-        clip_warning=clip_result == CLIP_SAVED_NO_HISTORY ?
-            " Clipboard history save/cleanup incomplete." : "";
+        clip_warning=clipboard_save_warning(clip_result);
+        if (is_cut && (clip_result==CLIP_SAVED_UNVERIFIED ||
+                       clip_result==CLIP_SAVED_UNVERIFIED_NO_HISTORY)) {
+            tell("Cut not performed; document retained.%s",clip_warning);return;
+        }
         if (is_cut) {
             remove_start=from;
             if (last==all && remove_start) {
@@ -6479,7 +7266,7 @@ resolve_command:
                 tell("Use paste [SLOT|default].");return;
             }
         }
-        exists=clipboard_read_named(slot,&clip);
+        exists=*arg ? clipboard_read_named(slot,&clip) : clipboard_read(&clip);
         if (exists<0) { tell("Clipboard read failed: %s.",strerror(errno));return; }
         if (exists==0 || clip.n==0) { tell("Clipboard empty.");free(clip.s);return; }
         /* Preserve original clipboard line endings; insert separators only
@@ -6517,28 +7304,16 @@ resolve_command:
     if (!strcmp(canonical, "dline")) {
         size_t last;
         if (!*arg) { line = current_line_number(); last = line; }
-        else {
-            if (!positive_number(arg, &rest, &line)) {
-                tell("Use dline [LINE|FIRST-LAST]; or COUNT dline."); return;
-            }
-            while (*rest == ' ' || *rest == '\t') rest++;
-            last = line;
-            if (*rest == '-') {
-                if (!positive_number(rest+1, &rest, &last)) {
-                    tell("Use dline FIRST-LAST, e.g. dline 30-43."); return;
-                }
-            }
-            if (!blank_tail(rest)) {
-                tell("Use dline [LINE|FIRST-LAST]; or COUNT dline."); return;
-            }
+        else if (!line_range(arg,&rest,&line,&last) || !blank_tail(rest)) {
+            tell("Use dline [LINE|FIRST-LAST], e.g. dline 104-eof; or COUNT dline."); return;
         }
         delete_line_range(line, last); return;
     }
     if (!strcmp(canonical, "goto")) {
         if (!*arg) { request_argument("goto","Line [column]> "); return; }
-        if (!positive_number(arg, &rest, &line) ||
+        if (!line_address(arg, &rest, &line) ||
             (p=numbered_line(line)) == SIZE_MAX) {
-            command_usage(info,"Choose a line from 1 to %zu; nothing moved.",line_count()); return;
+            command_usage(info,"Choose a line from 1 to %zu (or top/bof or bottom/eof); nothing moved.",line_count()); return;
         }
         column = 1;
         if (!blank_tail(rest) && (!positive_number(rest,&rest,&column) || !blank_tail(rest))) {
@@ -6698,6 +7473,9 @@ resolve_command:
     }
 }
 
+/* Confirmations bypass command editing and user bindings. Keep the observed
+ * overwrite snapshot alive through save_file(): approval is for that version,
+ * and a second outside change may require a fresh confirmation. */
 static void prompt_key(int c)
 {
     int kind = prompt;
@@ -6742,6 +7520,10 @@ static void prompt_key(int c)
     }
 }
 
+/* One byte-indexed line editor serves commands, filenames, and arguments.
+ * Submission depends on the prompt: find/replace text must stay literal,
+ * while ordinary commands go through execute(). Do not parse every prompt
+ * as a command or let recalled history overwrite filename/argument input. */
 static void command_key(int c)
 {
     size_t p;
@@ -6862,9 +7644,29 @@ static void command_key(int c)
     }
 }
 
+/* Preserve the desired terminal column across short lines. The cursor may
+ * stop at a short line's end without losing goal; other motion/edit paths
+ * clear goal_set so the next vertical run starts from the new column. */
 static void vertical(int direction, int count)
 {
-    size_t start = line_start(cursor), p;
+    size_t start, p;
+    if (wrap_enabled) {
+        start=wrap_at(cursor);
+        if (!goal_set) {goal=wrap_column(start,cursor);goal_set=true;}
+        while (count--) {
+            if (direction<0) {
+                if (!start) break;
+                start=wrap_at(start-1);
+            } else {
+                p=wrap_row(start).next;
+                if (p==SIZE_MAX) break;
+                start=p;
+            }
+        }
+        cursor=wrap_position(start,goal);
+        return;
+    }
+    start=line_start(cursor);
     if (!goal_set) { goal = column_at(start, cursor); goal_set = true; }
     while (count--) {
         if (direction < 0) {
@@ -6879,9 +7681,10 @@ static void vertical(int direction, int count)
     cursor = position_at(start, goal);
 }
 
-/* Movement mode is a separate control surface, not a global keymap.
- * It never inserts or deletes bytes, including for ordinary Delete/Backspace.
- * It deliberately mirrors Coldkeys' repeatable navigation conventions. */
+/* Unbound movement keys change position only; text_key() handles explicit
+ * user bindings before reaching this surface. Word motion groups ASCII
+ * letters/digits/underscore and all high bytes, rather than implementing
+ * Unicode word segmentation. */
 static bool word_byte(unsigned char c)
 {
     return c >= 128 || (c >= 'a' && c <= 'z') ||
@@ -6929,6 +7732,9 @@ static void movement_key(int c)
     /* Everything else is ignored, including text and deletion keys. */
 }
 
+/* This is the document surface only: main() has already routed modal input.
+ * Explicit user bindings take precedence even in movement mode; ordinary
+ * typing reaches edit(), which owns undo grouping and failure handling. */
 static void text_key(int c)
 {
     size_t p;
@@ -7010,6 +7816,16 @@ static void mouse_key(void)
     }
     if (command_mode || mouse_y < 1 || mouse_y > body) return;
     start=top;
+    if (wrap_enabled) {
+        start=wrap_at(start);
+        for (i=1;i<(size_t)mouse_y;i++) {
+            p=wrap_row(start).next;
+            if (p==SIZE_MAX) break;
+            start=p;
+        }
+        cursor=wrap_position(start,mouse_x>0 ? (size_t)(mouse_x-1) : 0);
+        goal_set=false;group=false;return;
+    }
     for (i=1;i<(size_t)mouse_y;i++) {
         p=next_line(start);
         if (p==start) break;
@@ -7022,8 +7838,11 @@ static void mouse_key(void)
 static void usage(void)
 {
     puts("editor " VERSION " - one-file, dependency-light terminal text editor\n"
-         "Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [FILE|-]\n"
+         "Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--wrap|--no-wrap] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n"
          "       editor --help | --manual | --about | --version\n\n"
+         "--no-cmd: disable all external shell commands and filters for this launch.\n"
+         "Build with -DEDITOR_NO_CMD to permanently omit external command execution.\n"
+         "This restriction is not an OS sandbox; normal file access remains.\n"
          "FILE: edit named file.  - or piped stdin: edit text from a pipe.\n"
          "Interactive UI uses the controlling terminal when stdin/stdout are pipes.\n"
          "Use write - to output only document bytes to redirected stdout.\n\n"
@@ -7034,12 +7853,14 @@ static void usage(void)
          "toggle-startup saves the opposite startup choice; -- ends option parsing.\n"
          "toggle-esc switches and saves Esc behavior; settings opens preferences.\n"
          "toggle-signals saves signal handling: OFF exits, ON cancels.\n"
-         "toggle-mouse and toggle-cliphistory switch and save those settings.\n"
+         "toggle-mouse, toggle-wrap and toggle-cliphistory switch and save those settings.\n"
+         "--wrap / --no-wrap: override display-only word wrapping (default On).\n"
          "Ctrl-C/Z are not bound. Unsaved text is lost on a default interrupt exit.\n"
          "Click status bar to open menu if mouse enabled (--mouse).\n"
          "No default hotkeys. User bindings via 'bind' and 'unbind'.\n\n"
          "Type list for commands by task; help for examples and guidance.\n"
          "No curses, terminfo, readline or external pager.\n");
+    printf("External commands: %s.\n",cmd_policy());
     puts(help_topics);
     puts("Build: cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor");
 }
@@ -7049,10 +7870,38 @@ int main(int argc, char **argv)
     int c, status=0;
     size_t p;
     bool dirty_screen=true, from_stdin=false;
+    /* Collect the one-way flag before any config or mode selection. Compact
+     * argv in place so it composes with --help and --manual; a literal
+     * filename following -- must never be treated as a policy switch. */
+    {
+        int i, n=1;
+        bool options=true;
+        for (i=1; i<argc; i++) {
+            if (options && !strcmp(argv[i],"--no-cmd")) {
+#ifndef EDITOR_NO_CMD
+                no_cmd=true;
+#endif
+                continue;
+            }
+            if (!strcmp(argv[i],"--")) options=false;
+            argv[n++]=argv[i];
+        }
+        argv[n]=NULL; argc=n;
+    }
+    /* Informational invocations work without a terminal or user config. */
     if (argc==2 && (!strcmp(argv[1],"--help") || !strcmp(argv[1],"-h"))) { usage(); return 0; }
-    if (argc==2 && !strcmp(argv[1],"--version")) { puts("editor " VERSION); return 0; }
+    if (argc==2 && !strcmp(argv[1],"--version")) {
+#ifdef EDITOR_NO_CMD
+        puts("editor " VERSION " (no-cmd build)");
+#else
+        puts(no_cmd ? "editor " VERSION " (no-cmd session)" : "editor " VERSION);
+#endif
+        return 0;
+    }
     if (argc==2 && !strcmp(argv[1],"--about")) { puts(about_text); return 0; }
     if (argc==2 && !strcmp(argv[1],"--manual")) { puts(manual_full()); return 0; }
+    /* Saved defaults are applied first; command-line switches override only
+     * this launch. Loading a preference does not write it back. */
     load_startup_config();
     {
         int i, file_arg=0;
@@ -7067,11 +7916,13 @@ int main(int argc, char **argv)
             else if (!strcmp(argv[i],"--cli")) menu_preferred=false;
             else if (!strcmp(argv[i],"--mouse")) mouse_enabled=true;
             else if (!strcmp(argv[i],"--no-mouse")) mouse_enabled=false;
+            else if (!strcmp(argv[i],"--wrap")) wrap_enabled=true;
+            else if (!strcmp(argv[i],"--no-wrap")) wrap_enabled=false;
             else if (!strcmp(argv[i],"--movement") || !strcmp(argv[i],"--move")) movement_mode=true;
             else if (!strcmp(argv[i],"--edit")) movement_mode=false;
             else if (!strcmp(argv[i],"--no-keys")) keys_disabled=true;
             else if (!file_arg && (!strcmp(argv[i],"-") || argv[i][0]!='-')) file_arg=i;
-            else { fputs("Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [FILE|-]\n",stderr); return 2; }
+            else { fputs("Usage: editor [--menu|--cli] [--mouse|--no-mouse] [--wrap|--no-wrap] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n",stderr); return 2; }
         }
         if (file_arg && !strcmp(argv[file_arg],"-")) from_stdin=true;
         else if (file_arg) filename=resolve_path(argv[file_arg]);
@@ -7103,6 +7954,8 @@ int main(int argc, char **argv)
         } else if (errno!=ENOENT) die(strerror(errno));
     }
     if (text.n && memchr(text.s, 0, text.n)) die("NUL byte in file; this editor edits text");
+    /* Piped text has no saved destination yet. Use an empty saved baseline
+     * so nonempty stdin starts as unsaved work, rather than as a clean file. */
     if (!copy_buffer(&saved, stream_input ? "" : (text.s ? text.s : ""),
                      stream_input ? 0 : text.n) || !reserve(&text, text.n+1))
         die("out of memory");
@@ -7136,6 +7989,7 @@ int main(int argc, char **argv)
     else if (startup_config_error) tell("Config not loaded: %s. Type settings show for path and settings.",strerror(startup_config_error));
     else if (!user_commands_loaded) tell("User commands unavailable: commands.conf invalid or unreadable.");
     else if (startup_config_warning) tell("Invalid config entry ignored. Type settings show for values/path.");
+    else if (no_cmd) tell("editor " VERSION " | no-cmd | list | help | manual");
     else tell("editor " VERSION " | list | help | manual | about");
     while (running && !terminated) {
         if (suspended) {
@@ -7143,6 +7997,8 @@ int main(int argc, char **argv)
                 clipboard_leave_after_save=false;
                 clear_prompt(); command_mode = false;
             }
+            /* Give the shell its terminal settings before the actual stop.
+             * On fg/resume, start afresh and invalidate the rendered screen. */
             terminal_restore(); suspended = 0;
             if (terminated) break;
             install_handler(SIGTSTP, SIG_DFL); (void)raise(SIGTSTP);
@@ -7160,6 +8016,8 @@ int main(int argc, char **argv)
                 interrupted = 0; dirty_screen = true; continue;
             }
             interrupted = 0;
+            /* Ordinary cancelled input is dropped. A cancelled paste keeps
+             * unread bytes so its end marker can still be found and consumed. */
             if (!paste_discard) input_at = input_n;
             discard_sequence = 0;
             viewer_text = viewer_title = NULL;
@@ -7180,10 +8038,16 @@ int main(int argc, char **argv)
             if (!terminal_active) continue;
             dirty_screen = true;
         }
+        /* Coalesce a buffered burst into one redraw, but service resize now.
+         * key() still checks signals between bytes. */
         if (resized || (dirty_screen && input_at == input_n)) { draw(); dirty_screen = false; }
+        if (resized || terminated || suspended || interrupted) continue;
         c = key();
         if (c == KEY_EOF) { status = 1; break; }
         if (c == KEY_NONE) continue;
+        /* Order is part of the UI contract. Paste must be framed in every
+         * mode; confirmations and the history browser precede mouse input;
+         * only the final document branch may reach user bindings/typing. */
         if (c == KEY_PASTE) paste(); /* Swallow paste in modal modes. */
         else if (prompt != PROMPT_NONE) prompt_key(c);
         else if (reverse_mode) reverse_key(c);

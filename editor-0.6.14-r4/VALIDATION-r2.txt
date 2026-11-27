@@ -1,0 +1,37 @@
+EDITOR 0.6.14-r2 - VALIDATION
+
+Linux x86_64, GCC 14.2.0 and Clang 17.0.0. Strict C99 -O2 with
+-Wall -Wextra -Werror -pedantic: final normal and EDITOR_NO_CMD builds pass.
+The restricted executable was inspected with nm (no process-execution
+imports). The rollback core and actual PTY regression suite passed on the
+final source. No native OpenBSD or full original 0.6.14 suite was available.
+
+New core regression tests (normal and restricted) passed: deterministic
+pathname swaps at the final fstat of an ordinary read, a read command and
+journal load; directory error; resize signal during ioctl; undefine with
+trailing blanks; row-cache behavior; 12,000 seeded mixed-byte edit iterations
+with independent byte/line model, undo/redo and branching per build. The r1
+baseline failed the ordinary read race test as expected. Both new core and
+rollback core tests passed Clang ASan/UBSan with leak detection, before the
+last one-line main-loop followup to immediately service pending flags after
+draw. That final line was covered by the final strict builds and PTY rerun,
+not a new full sanitizer run.
+
+BENCHMARK
+Three trials of 15,000 80x24 ordinary redraws and 1,000 8 MiB single-line
+redraws, output to /dev/null, on the same host and GCC flags. Median elapsed
+seconds r1 -> r2: ordinary 0.340138 -> 0.341185 (no meaningful improvement);
+long line 0.457802 -> 0.372410 (18.7% lower). Realloc calls across ordinary
+redraws: 405,000 -> 59,999 (85.2% fewer); long line: 27,000 -> 3,999.
+Terminal-frame comparison (11,717 bytes) matched exactly, including LF,
+CRLF, tabs, malformed and valid UTF-8, empty rows, trailing newline,
+horizontal scrolling and search-independent cursor positions. Benchmark is
+not an end-to-end terminal latency or all-workloads speed guarantee.
+
+Reproduce:
+  tests/run.sh /path/to/commented-editor-0.6.14.c
+  tests/run-stability.sh /path/to/editor-0.6.14-r1.c
+Results are in tests/results/. The renderer benchmark expects C.UTF-8 for
+its UTF-8 fixture. The original suite, native OpenBSD, low-disk/low-memory
+fault tests, prolonged PTY sessions and broader terminal checks are still
+release gates. Optimistic pathname checks do not provide filesystem locks.

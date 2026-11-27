@@ -1,0 +1,2 @@
+editor-r1-stability: tests/stability-core.c:75: race_tests: Assertion `!read_file("old.txt",&b,&st)' failed.
+Expected baseline failure status: 134

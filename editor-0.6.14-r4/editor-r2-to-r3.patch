@@ -1,0 +1,286 @@
+--- editor.c
++++ editor.c
+@@ -1,5 +1,5 @@
+ /*
+- * editor 0.6.14-r2 - a small, single-file terminal text editor.
++ * editor 0.6.14-r3 - a small, single-file terminal text editor.
+  * Build: cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor
+  * Run:   ./editor [FILE]
+  *
+@@ -79,7 +79,7 @@
+ #define LIMIT ((size_t)8 * 1024 * 1024)
+ #define COMMAND_SIZE 4096
+ #define CONFIG_LIMIT ((size_t)32768)
+-#define VERSION "0.6.14-r2"
++#define VERSION "0.6.14-r3"
+ /* An immutable build policy, or a one-way launch policy. No setting,
+  * command, script or environment variable can turn shell execution back on. */
+ #ifdef EDITOR_NO_CMD
+@@ -134,7 +134,7 @@
+ 
+ static const char manual_text[] =
+     "EDITOR MANUAL\n"
+-    "editor 0.6.14-r2\n"
++    "editor 0.6.14-r3\n"
+     "\n"
+     "RUN: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n"
+     "\n"
+@@ -3090,9 +3090,9 @@
+     const char *base = getenv("XDG_STATE_HOME"), *home = getenv("HOME");
+     char *root, *work, *result, *p;
+     size_t n;
+-    if (!path) return NULL;
++    if (!path) { errno = EINVAL; return NULL; }
+     if (!base || *base != '/') {
+-        if (!home || *home != '/') return NULL;
++        if (!home || *home != '/') { errno = EINVAL; return NULL; }
+         n = strlen(home) + sizeof "/.local/state";
+         root = malloc(n);
+         if (!root) return NULL;
+@@ -3114,8 +3114,11 @@
+     if (!private_directory(work)) { free(root); free(work); return NULL; }
+     {
+         struct stat st;
+-        if (lstat(work, &st) < 0 || st.st_uid != geteuid() || (st.st_mode & 077)) {
+-            free(root); free(work); return NULL;
++        if (lstat(work, &st) < 0) {
++            int error = errno; free(root); free(work); errno = error; return NULL;
++        }
++        if (!S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 077)) {
++            free(root); free(work); errno = EACCES; return NULL;
+         }
+     }
+     n = strlen(work) + 1 + 16 + sizeof ".undo";
+@@ -3222,6 +3225,37 @@
+         Change *place = position == UINT64_MAX ? NULL : head;
+         Change *external = NULL;
+         if (place) for (i = 0; i < position; i++) place = place->next;
++        /* Check all reconstructed lengths and cursor offsets before making
++         * a journal live. A damaged journal must not leave an impossible
++         * history state waiting to crash during later navigation. These are
++         * O(transaction count) checks, without replaying large file buffers.
++         * history_step() checks each edge's expected bytes when it is used;
++         * structural validation here does not replace that content check. */
++        {
++            Change *q;
++            size_t length = state.n, oldest_length;
++            for (q = place; q; q = q->prev) {
++                size_t previous;
++                if (q->at > length || q->new_n > length - q->at ||
++                    q->old_n > LIMIT - (length - q->new_n) ||
++                    q->after > length) goto done;
++                previous = length - q->new_n + q->old_n;
++                if (q->before > previous) goto done;
++                length = previous;
++            }
++            oldest_length = length;
++            for (q = head; q; q = q->next) {
++                size_t following;
++                if (q->at > length || q->old_n > length - q->at ||
++                    q->new_n > LIMIT - (length - q->old_n) ||
++                    q->before > length) goto done;
++                following = length - q->old_n + q->new_n;
++                if (q->after > following) goto done;
++                length = following;
++                if (q == place && length != state.n) goto done;
++            }
++            if (!place && oldest_length != state.n) goto done;
++        }
+         if (outside) {
+             /* No existing file to compare with means a removed/recreated path,
+              * not a safely identified external content change. */
+@@ -3264,37 +3298,6 @@
+             place = external;
+             journal_rebased = true;
+         }
+-        /* Check all reconstructed lengths and cursor offsets before making
+-         * a journal live. A damaged journal must not leave an impossible
+-         * history state waiting to crash during later navigation. These are
+-         * O(transaction count) checks, without replaying large file buffers.
+-         * history_step() checks each edge's expected bytes when it is used;
+-         * structural validation here does not replace that content check. */
+-        {
+-            Change *q;
+-            size_t length = journal_rebased ? saved.n : state.n, oldest_length;
+-            for (q = place; q; q = q->prev) {
+-                size_t previous;
+-                if (q->at > length || q->new_n > length - q->at ||
+-                    q->old_n > LIMIT - (length - q->new_n) ||
+-                    q->after > length) goto done;
+-                previous = length - q->new_n + q->old_n;
+-                if (q->before > previous) goto done;
+-                length = previous;
+-            }
+-            oldest_length = length;
+-            for (q = head; q; q = q->next) {
+-                size_t following;
+-                if (q->at > length || q->old_n > length - q->at ||
+-                    q->new_n > LIMIT - (length - q->old_n) ||
+-                    q->before > length) goto done;
+-                following = length - q->old_n + q->new_n;
+-                if (q->after > following) goto done;
+-                length = following;
+-                if (q == place && length != (journal_rebased ? saved.n : state.n)) goto done;
+-            }
+-            if (!place && oldest_length != (journal_rebased ? saved.n : state.n)) goto done;
+-        }
+         history = head; head = NULL;
+         current = place;
+         history_tail = tail;
+@@ -3316,8 +3319,9 @@
+ }
+ /* Save the current text snapshot plus applied and redo history. Callers must
+  * first establish that text has been saved; this routine cannot prove that.
+- * Failure preserves the in-memory chain. Success means the new journal was
+- * published; the later directory sync is best-effort, not a rollback point. */
++ * Failure preserves the in-memory chain. Success requires publication,
++ * synchronization of the containing directory and a final identity check.
++ * A failure after publication is a warning, not a rollback. */
+ static bool journal_save(void)
+ {
+     char *path = journal_path(filename), *tmp = NULL, *dir = NULL, *slash;
+@@ -3329,18 +3333,21 @@
+     JournalOutput out = {0};
+     int fd = -1, dir_fd = -1, old_fd = -1;
+     struct stat st, written, check;
+-    bool ok = false, old_present = false, temporary_created = false;
+-    if (!path) return false;
++    bool ok = false, old_present = false, temporary_created = false, published = false;
++    if (!path) { if (history) journal_dirty = true; return false; }
+     path_n = strlen(filename);
+-    if (path_n > 16384 || text.n > LIMIT) goto done;
++    if (path_n > 16384) { errno = ENAMETOOLONG; goto done; }
++    if (text.n > LIMIT) { errno = EFBIG; goto done; }
+     for (p = history; p; p = p->next) {
+         if (p == current) current_position = (uint64_t)count;
+         if (++count > JOURNAL_CHANGE_LIMIT || bytes > JOURNAL_LIMIT - 40 ||
+             p->old_n > JOURNAL_LIMIT - bytes - 40 ||
+-            p->new_n > JOURNAL_LIMIT - bytes - p->old_n - 40) goto done;
++            p->new_n > JOURNAL_LIMIT - bytes - p->old_n - 40) {
++            errno = EFBIG; goto done;
++        }
+         bytes += 40 + p->old_n + p->new_n;
+     }
+-    if (bytes > JOURNAL_LIMIT - text.n - path_n - 48) goto done;
++    if (bytes > JOURNAL_LIMIT - text.n - path_n - 48) { errno = EFBIG; goto done; }
+     /* Preserve an old, incompatible journal rather than destroying past work. */
+     old_fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
+     if (old_fd >= 0) {
+@@ -3417,22 +3424,28 @@
+     /* Keep any stale link after publication. Before this point, failure
+      * cleanup removes only the archive link created by this invocation. */
+     archived_linked = false;
++    published = true;
+     free(loaded_journal_path);
+     loaded_journal_path = strdup(path);
+     loaded_journal_stat_valid = loaded_journal_path && lstat(path, &check) == 0 &&
+         check.st_dev == written.st_dev && check.st_ino == written.st_ino &&
+-        check.st_size == written.st_size &&
++        check.st_size == written.st_size && check.st_mode == written.st_mode &&
++        check.st_uid == written.st_uid && check.st_gid == written.st_gid &&
++        check.st_nlink == 1 &&
+         check.st_mtim.tv_sec == written.st_mtim.tv_sec &&
+         check.st_mtim.tv_nsec == written.st_mtim.tv_nsec;
+-    if (loaded_journal_stat_valid) loaded_journal_stat = check;
++    if (!loaded_journal_stat_valid) { errno = EAGAIN; goto done; }
++    loaded_journal_stat = check;
+     slash = strrchr(path, '/');
+-    if (slash) {
+-        dir = strdup(path);
+-        if (dir) {
+-            dir[slash - path] = 0;
+-            dir_fd = open(dir, O_RDONLY);
+-            if (dir_fd >= 0) (void)sync_fd(dir_fd);
+-        }
++    if (!slash) { errno = EINVAL; goto done; }
++    dir = strdup(path);
++    if (!dir) goto done;
++    dir[slash - path] = 0;
++    dir_fd = open(*dir ? dir : "/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
++    if (dir_fd < 0 || sync_fd(dir_fd) < 0) goto done;
++    /* The journal may have been replaced during directory sync. */
++    if (lstat(path, &check) < 0 || !same_disk_version(&loaded_journal_stat, &check)) {
++        errno = EAGAIN; goto done;
+     }
+     journal_dirty = false;
+     journal_branched = false;
+@@ -3443,7 +3456,11 @@
+       if (dir_fd >= 0) close(dir_fd);
+       if (old_fd >= 0) close(old_fd);
+       if (fd >= 0) close(fd);
+-      if (!ok && temporary_created) (void)unlink(tmp);
++      if (!published && temporary_created) (void)unlink(tmp);
++      if (!ok) {
++          if (published) loaded_journal_stat_valid = false;
++          if (history) journal_dirty = true;
++      }
+       if (archived_linked) (void)unlink(archived);
+       errno = error;
+     }
+@@ -3532,19 +3549,33 @@
+         /* clipboard.txt is a private scratch buffer, not a normal edited
+          * document. Auto-save may replace a newer clipboard without asking.
+          * Ordinary files keep the full overwrite-confirmation behavior. */
+-        if (outside && !editing_clipboard &&
+-            (!approved || !disk_matches(&conflict_snapshot, &conflict_stat, &disk, &st))) {
+-            ask_overwrite(&disk, &st, path, other_file); goto done;
+-        }
+         if (!outside && !changed()) {
+-            if (journal_dirty && history && !journal_save())
+-                tell("Unchanged; undo history could not be persisted.");
++            if (journal_dirty && history && !journal_save()) {
++                if (errno == EFBIG)
++                    tell("Unchanged; undo journal limit reached. Live history retained.");
++                else tell("Unchanged; undo history could not be persisted.");
++            }
+             else {
+                 tell("Already saved (unchanged).");
+                 clipboard_written = editing_clipboard;
+             }
+             goto done;
+         }
++        /* Rename uses directory permissions, so verify file write access
++         * before prompting or allocating undo steps. Do not truncate. */
++        if (!(st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) {
++            tell("File is not writable. Use write FILE for a new path."); goto done;
++        }
++        permission_fd = open(path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW);
++        if (permission_fd < 0) goto failure;
++        if (fstat(permission_fd, &check) < 0) goto failure;
++        if (!same_disk_version(&check, &st)) {
++            tell("File changed during write preparation. Try write again."); goto done;
++        }
++        if (outside && !editing_clipboard &&
++            (!approved || !disk_matches(&conflict_snapshot, &conflict_stat, &disk, &st))) {
++            ask_overwrite(&disk, &st, path, other_file); goto done;
++        }
+         /* Allocate the external-content recovery steps before committing.
+          * If insufficient memory, leave the outside writer's data untouched. */
+         if (outside && !same_bytes(&disk, &text)) {
+@@ -3555,15 +3586,6 @@
+                 tell("Cannot preserve external changes in undo. Write cancelled."); goto done;
+             }
+         }
+-        if (!(st.st_mode & (S_IWUSR | S_IWGRP | S_IWOTH))) {
+-            tell("File is not writable. Use write FILE for a new path."); goto done;
+-        }
+-        permission_fd = open(path, O_WRONLY | O_NONBLOCK | O_NOFOLLOW);
+-        if (permission_fd < 0) goto failure;
+-        if (fstat(permission_fd, &check) < 0) goto failure;
+-        if (!same_disk_version(&check, &st)) {
+-            tell("File changed during write preparation. Try write again."); goto done;
+-        }
+         mode = editing_clipboard ? 0600 : st.st_mode & 0777;
+     } else {
+         if (same && existed && !editing_clipboard) {
+@@ -3644,7 +3666,9 @@
+     } else tell("Written.");
+     if (!journal_save()) {
+         warn_history = true;
+-        tell("Written; undo history could not be persisted.");
++        if (errno == EFBIG)
++            tell("Written; undo journal limit reached. Live history retained.");
++        else tell("Written; undo history could not be persisted.");
+     }
+     if (clip_history_enabled && present && !same_bytes(&disk,&text)) {
+         char *clip_path=clipboard_path(false);

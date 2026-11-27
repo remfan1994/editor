@@ -1,0 +1,170 @@
+--- editor.c
++++ editor.c
+@@ -1,5 +1,5 @@
+ /*
+- * editor 0.6.14-r1 - a small, single-file terminal text editor.
++ * editor 0.6.14-r2 - a small, single-file terminal text editor.
+  * Build: cc -std=c99 -O2 -Wall -Wextra -pedantic editor.c -o editor
+  * Run:   ./editor [FILE]
+  *
+@@ -79,7 +79,7 @@
+ #define LIMIT ((size_t)8 * 1024 * 1024)
+ #define COMMAND_SIZE 4096
+ #define CONFIG_LIMIT ((size_t)32768)
+-#define VERSION "0.6.14-r1"
++#define VERSION "0.6.14-r2"
+ /* An immutable build policy, or a one-way launch policy. No setting,
+  * command, script or environment variable can turn shell execution back on. */
+ #ifdef EDITOR_NO_CMD
+@@ -134,7 +134,7 @@
+ 
+ static const char manual_text[] =
+     "EDITOR MANUAL\n"
+-    "editor 0.6.14-r1\n"
++    "editor 0.6.14-r2\n"
+     "\n"
+     "RUN: editor [--menu|--cli] [--mouse|--no-mouse] [--movement|--edit] [--no-keys] [--no-cmd] [FILE|-]\n"
+     "\n"
+@@ -821,9 +821,9 @@
+ 
+ /* Map a display column back to a byte offset on this line. A target inside a
+  * tab, wide character or visible escape selects that unit's beginning. */
+-static size_t position_at(size_t start, size_t column)
++static size_t position_in_line(size_t start, size_t end, size_t column)
+ {
+-    size_t end = line_end(start), x = 0, count;
++    size_t x = 0, count;
+     size_t lo=0,hi=layout_count,mid;
+     char rep[32]; int width; bool wide;
+     /* Existing checkpoints can skip the off-screen prefix. Do not build
+@@ -847,6 +847,11 @@
+     return start;
+ }
+ 
++static size_t position_at(size_t start, size_t column)
++{
++    return position_in_line(start, line_end(start), column);
++}
++
+ /* Search only the candidate start positions in [first, limit). A forward
+  * search stops at its first match; a backward search retains the last one.
+  * KMP still handles repetitive/overlapping text in linear time. Restricting
+@@ -1240,13 +1245,13 @@
+ static bool read_file(const char *path, Buffer *b, struct stat *st)
+ {
+     int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW);
+-    struct stat after;
++    struct stat after, named;
+     char chunk[8192]; ssize_t n;
+     bool ok = false;
+     if (b==&text) layout_reset();
+     if (fd < 0) return false;
+     if (fstat(fd, st) < 0) goto done;
+-    if (!S_ISREG(st->st_mode)) { errno = EINVAL; goto done; }
++    if (!S_ISREG(st->st_mode)) { errno = S_ISDIR(st->st_mode) ? EISDIR : EINVAL; goto done; }
+     if (st->st_size < 0 || (uint64_t)st->st_size > LIMIT) {
+         errno = EFBIG; goto done;
+     }
+@@ -1267,6 +1272,8 @@
+      * version to show or overwrite. Reject and let the user retry. */
+     if (fstat(fd, &after) < 0) goto done;
+     if (!same_disk_version(st, &after)) { errno = EAGAIN; goto done; }
++    if (lstat(path, &named) < 0) goto done;
++    if (!same_disk_version(&after, &named)) { errno = EAGAIN; goto done; }
+     ok = true;
+ done:
+     { int error = errno; if (close(fd) < 0 && ok) return false; errno = error; }
+@@ -3206,6 +3213,10 @@
+     { char extra; if (read(fd, &extra, 1) != 0) goto done; }
+     if (fstat(fd, &after) < 0 || !same_disk_version(&st, &after)) goto done;
+     {
++        struct stat named;
++        if (lstat(path, &named) < 0 || !same_disk_version(&after, &named)) goto done;
++    }
++    {
+         bool outside = state.n != saved.n ||
+                        (state.n && memcmp(state.s, saved.s, state.n));
+         Change *place = position == UINT64_MAX ? NULL : head;
+@@ -3757,13 +3768,14 @@
+ static void dimensions(void)
+ {
+     struct winsize ws;
++    resized = 0; /* A signal during this query must remain pending. */
+     if (ioctl(tty_out, TIOCGWINSZ, &ws) == 0) {
+         rows = ws.ws_row ? ws.ws_row : 24;
+         cols = ws.ws_col ? ws.ws_col : 80;
+     }
+     if (rows > 1000) rows = 1000;
+     if (cols > 4096) cols = 4096;
+-    reset_screen(); resized = 0;
++    reset_screen();
+ }
+ 
+ /* p is a byte offset and x its display column; callers may start at a cached
+@@ -3829,15 +3841,24 @@
+ {
+     Buffer row_text = {0};
+     char address[48];
+-    output(&row_text, reverse ? "\033[7m" : "\033[0m");
++    const char *prefix = reverse ? "\033[7m" : "\033[0m";
++    static const char suffix[] = "\033[0m\033[K";
++    const char *previous = previous_rows[row];
++    const size_t prefix_n = 4, suffix_n = sizeof suffix - 1;
++    /* Compare the existing rendering before allocating a new row. Most
++     * rows are unchanged during cursor movement and command entry. */
++    if (drawing_failed) return;
++    if (previous && strlen(previous) == prefix_n + line->n + suffix_n &&
++        !memcmp(previous, prefix, prefix_n) &&
++        (!line->n || !memcmp(previous + prefix_n, line->s, line->n)) &&
++        !memcmp(previous + prefix_n + line->n, suffix, suffix_n)) return;
++    output(&row_text, prefix);
+     if (line->n) add(&row_text, line->s, line->n);
+-    output(&row_text, "\033[0m\033[K");
++    output(&row_text, suffix);
+     if (drawing_failed) { free(row_text.s); return; }
+-    if (!previous_rows[row] || strcmp(previous_rows[row], row_text.s)) {
+-        snprintf(address, sizeof address, "\033[%d;1H", row + 1);
+-        output(out, address); add(out, row_text.s, row_text.n);
+-        free(previous_rows[row]); previous_rows[row] = row_text.s;
+-    } else free(row_text.s);
++    snprintf(address, sizeof address, "\033[%d;1H", row + 1);
++    output(out, address); add(out, row_text.s, row_text.n);
++    free(previous_rows[row]); previous_rows[row] = row_text.s;
+ }
+ 
+ /* Wrap read-only pages in terminal columns. Besides the ASCII manual,
+@@ -4208,7 +4229,7 @@
+         end = line_end(p);
+         screen_p=p;screen_x=0;
+         if (left) {
+-            screen_p=position_at(p,left);
++            screen_p=position_in_line(p,end,left);
+             screen_x=column_at(p,screen_p);
+         }
+         if (search_mark!=SIZE_MAX && search_length && search_mark>=p &&
+@@ -4220,7 +4241,7 @@
+         else visible_from(&line,text.s ? text.s+p : "",end-p,left,
+                           (size_t)(cols-1),screen_p-p,screen_x);
+         draw_row(&out, r, &line, false);
+-        if (end < text.n) p = next_line(p);
++        if (end < text.n) p = end + (text.s[end] == '\r' ? 2 : 1);
+         else {
+             r++;
+             for (; r < body; r++) { line.n = 0; draw_row(&out, r, &line, false); }
+@@ -6871,7 +6892,7 @@
+         if (!*arg) request_argument("undefine","User name> ");
+         else if (!blank_tail(arg+strcspn(arg," \t")))
+             command_usage(info,"Use undefine NAME, no extra arguments.");
+-        else (void)change_user_command(arg,NULL);
++        else { arg[strcspn(arg," \t")]=0; (void)change_user_command(arg,NULL); }
+         return;
+     }
+     if (!strcmp(canonical,"run")) {
+@@ -7793,6 +7814,7 @@
+         /* Coalesce a buffered burst into one redraw, but service resize now.
+          * key() still checks signals between bytes. */
+         if (resized || (dirty_screen && input_at == input_n)) { draw(); dirty_screen = false; }
++        if (resized || terminated || suspended || interrupted) continue;
+         c = key();
+         if (c == KEY_EOF) { status = 1; break; }
+         if (c == KEY_NONE) continue;

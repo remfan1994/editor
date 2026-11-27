@@ -1,0 +1,18 @@
+normal:
+PASS file sync ENOSPC preserves old journal and live undo
+PASS post-commit directory sync failure keeps dirty undo and retry succeeds
+PASS journal replaced during directory sync detected; live chain intact
+PASS journal permission change after publication rejected
+PASS malformed redo rejected before external-content rebase
+PASS valid redo reopen and outside rebase, undo and redo
+PASS journal count limit reports cause and retains live history
+PASS read-only destination refused before overwrite prompt
+restricted:
+PASS file sync ENOSPC preserves old journal and live undo
+PASS post-commit directory sync failure keeps dirty undo and retry succeeds
+PASS journal replaced during directory sync detected; live chain intact
+PASS journal permission change after publication rejected
+PASS malformed redo rejected before external-content rebase
+PASS valid redo reopen and outside rebase, undo and redo
+PASS journal count limit reports cause and retains live history
+PASS read-only destination refused before overwrite prompt

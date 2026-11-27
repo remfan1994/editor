@@ -1,0 +1,32 @@
+cc (Debian 14.2.0-19) 14.2.0
+clang version 17.0.0 (https://github.com/swiftlang/llvm-project.git 10999b6d034fe318f3d56c83bddb6572593a8bb0)
+Linux x86_64
+/tmp/editor-r2-stability-normal
+PASS deterministic pathname replacement during file read, read command and journal load; directory error
+PASS resize during query, whitespace after undefine, row cache text/style/empty changes
+PASS 12000 deterministic mixed-byte edit iterations, line layout, undo/redo and branching
+/tmp/editor-r2-san-normal
+PASS deterministic pathname replacement during file read, read command and journal load; directory error
+PASS resize during query, whitespace after undefine, row cache text/style/empty changes
+PASS 12000 deterministic mixed-byte edit iterations, line layout, undo/redo and branching
+/tmp/editor-r2-rollback-san-normal
+PASS symbolic ranges, CRLF/LF, goto endpoints, invalid ranges, undo/redo
+PASS persistent custom synonym precedence, help aliases, canonical protection, undefine, script dispatch
+PASS symbolic copy/cut, selected-slot paste, failed clipboard cut preserves text
+PASS read-only save refusal and ordinary save after permission restored
+PASS normal shell/filter and closed stdin descriptor regression
+PASS no-cmd direct, script, custom command, hotkey and filter boundary
+/tmp/editor-r2-stability-restricted
+PASS deterministic pathname replacement during file read, read command and journal load; directory error
+PASS resize during query, whitespace after undefine, row cache text/style/empty changes
+PASS 12000 deterministic mixed-byte edit iterations, line layout, undo/redo and branching
+/tmp/editor-r2-san-restricted
+PASS deterministic pathname replacement during file read, read command and journal load; directory error
+PASS resize during query, whitespace after undefine, row cache text/style/empty changes
+PASS 12000 deterministic mixed-byte edit iterations, line layout, undo/redo and branching
+PASS symbolic ranges, CRLF/LF, goto endpoints, invalid ranges, undo/redo
+PASS persistent custom synonym precedence, help aliases, canonical protection, undefine, script dispatch
+PASS symbolic copy/cut, selected-slot paste, failed clipboard cut preserves text
+PASS read-only save refusal and ordinary save after permission restored
+PASS no-cmd direct, script, custom command, hotkey and filter boundary
+PASS restricted binary no process-execution imports

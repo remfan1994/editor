@@ -1,0 +1,14 @@
+PASS symbolic ranges, CRLF/LF, goto endpoints, invalid ranges, undo/redo
+PASS persistent custom synonym precedence, help aliases, canonical protection, undefine, script dispatch
+PASS symbolic copy/cut, selected-slot paste, failed clipboard cut preserves text
+PASS read-only save refusal and ordinary save after permission restored
+PASS normal shell/filter and closed stdin descriptor regression
+PASS no-cmd direct, script, custom command, hotkey and filter boundary
+PASS symbolic ranges, CRLF/LF, goto endpoints, invalid ranges, undo/redo
+PASS persistent custom synonym precedence, help aliases, canonical protection, undefine, script dispatch
+PASS symbolic copy/cut, selected-slot paste, failed clipboard cut preserves text
+PASS read-only save refusal and ordinary save after permission restored
+PASS no-cmd direct, script, custom command, hotkey and filter boundary
+PASS actual PTY symbolic deletion, save, baseline undo compatibility, custom synonym and binding
+PASS actual PTY runtime and compile-time restrictions, persisted hotkey, nested script, normal edits
+PASS literal --no-cmd filename after -- retains normal command policy

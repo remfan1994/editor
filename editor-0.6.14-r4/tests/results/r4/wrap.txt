@@ -1,0 +1,12 @@
+normal:
+PASS word boundaries, CRLF, blank/EOF rows, logical line numbers, visual motion, resize
+PASS long words, tabs, visible controls, malformed bytes, UTF-8 wide characters (when supported)
+PASS sparse wrapped-row cache after edits, undo/redo, width changes, long document byte preservation
+PASS persistent toggle, both menu paths, settings reporting, mouse, actual row rendering, no undo/dirty side effects
+restricted:
+PASS word boundaries, CRLF, blank/EOF rows, logical line numbers, visual motion, resize
+PASS long words, tabs, visible controls, malformed bytes, UTF-8 wide characters (when supported)
+PASS sparse wrapped-row cache after edits, undo/redo, width changes, long document byte preservation
+PASS persistent toggle, both menu paths, settings reporting, mouse, actual row rendering, no undo/dirty side effects
+PASS actual PTY default, live toggle, saved setting, launch overrides, resize, byte-identical write: normal
+PASS actual PTY default, live toggle, saved setting, launch overrides, resize, byte-identical write: restricted

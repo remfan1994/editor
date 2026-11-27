@@ -1,0 +1,2 @@
+interim-r2: tests/interim-core.c:95: journal_failures: Assertion `!changed() && journal_dirty && !loaded_journal_stat_valid' failed.
+Exit status: 134
